@@ -1,4 +1,4 @@
-# mmult_aie2.py -*- Python -*-
+# mmult.py -*- Python -*-
 #
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
@@ -16,12 +16,48 @@ import sys
 import argparse
 import re
 
+# Per-architecture model parameters. These were two near-identical files
+# (mmult_aie2.py / mmult_aie2p.py) differing only in the values below; the
+# numbers are carried over verbatim from each.
+ARCH = {
+    "aie2": {
+        "herd_m": 4,
+        "extra_datatypes": [],
+        "vec_ops": {"i8": 32, "bf16": 32, "i32": 16},
+        "macs_i8": 256,
+        "du_count": [4, 4],
+        "du_port_bps": 16000000000,
+        "noc_port_count": 8,
+        "noc_port_bps": 16000000000,
+        "granularity": "herd",
+    },
+    "aie2p": {
+        "herd_m": 8,
+        # The aie2p path accumulates in f32 (aie2 stays bf16), so the model must
+        # know its width or the runner cannot size a transfer. Width only --
+        # `datatypes` is read solely for bytes-per-element (Runner.cpp
+        # getTransferCost, RunnerNode.cpp getMemoryCostInBytes).
+        "extra_datatypes": [{"bytes": 4, "name": "f32"}],
+        "vec_ops": {"i8": 64, "bf16": 64, "i32": 32},
+        "macs_i8": 1024,
+        "du_count": [8, 4],
+        "du_port_bps": 4000000000,
+        "noc_port_count": 16,
+        "noc_port_bps": 4000000000,
+        "granularity": "core",
+    },
+}
+
 # Default values.
-HERD_M = 4
 HERD_N = 4
 
 
-def mmult_runner(air_ir_string: str, herd_m: int = HERD_M, herd_n: int = HERD_N):
+def mmult_runner(
+    air_ir_string: str, arch_name: str, herd_m: int = None, herd_n: int = HERD_N
+):
+    A = ARCH[arch_name]
+    if herd_m is None:
+        herd_m = A["herd_m"]
     context = air.ir.Context()
     air_module = Module.parse(air_ir_string, context=context)
 
@@ -70,29 +106,51 @@ def mmult_runner(air_ir_string: str, herd_m: int = HERD_M, herd_n: int = HERD_N)
             {"bytes": 1, "name": "i8"},
             {"bytes": 2, "name": "bf16"},
             {"bytes": 4, "name": "i32"},
+            *A["extra_datatypes"],
         ],
         "devicename": "testdevice",
         "cost_model": {
             "op_costs": {
                 "linalg.copy": {
                     "datatypes": {
-                        "i8": {"ops_per_core_per_cycle": 32, "efficiency": 1},
-                        "bf16": {"ops_per_core_per_cycle": 32, "efficiency": 1},
-                        "i32": {"ops_per_core_per_cycle": 16, "efficiency": 1},
+                        "i8": {
+                            "ops_per_core_per_cycle": A["vec_ops"]["i8"],
+                            "efficiency": 1,
+                        },
+                        "bf16": {
+                            "ops_per_core_per_cycle": A["vec_ops"]["bf16"],
+                            "efficiency": 1,
+                        },
+                        "i32": {
+                            "ops_per_core_per_cycle": A["vec_ops"]["i32"],
+                            "efficiency": 1,
+                        },
                     },
                     "name": "linalg.copy",
                 },
                 "linalg.fill": {
                     "datatypes": {
-                        "i8": {"ops_per_core_per_cycle": 32, "efficiency": 1},
-                        "bf16": {"ops_per_core_per_cycle": 32, "efficiency": 1},
-                        "i32": {"ops_per_core_per_cycle": 16, "efficiency": 1},
+                        "i8": {
+                            "ops_per_core_per_cycle": A["vec_ops"]["i8"],
+                            "efficiency": 1,
+                        },
+                        "bf16": {
+                            "ops_per_core_per_cycle": A["vec_ops"]["bf16"],
+                            "efficiency": 1,
+                        },
+                        "i32": {
+                            "ops_per_core_per_cycle": A["vec_ops"]["i32"],
+                            "efficiency": 1,
+                        },
                     },
                     "name": "linalg.fill",
                 },
                 "linalg.generic": {
                     "datatypes": {
-                        "i8": {"macs_per_core_per_cycle": 256, "efficiency": 1},
+                        "i8": {
+                            "macs_per_core_per_cycle": A["macs_i8"],
+                            "efficiency": 1,
+                        },
                         "bf16": {"macs_per_core_per_cycle": 128, "efficiency": 1},
                         "i32": {"macs_per_core_per_cycle": 1, "efficiency": 1},
                     },
@@ -100,7 +158,10 @@ def mmult_runner(air_ir_string: str, herd_m: int = HERD_M, herd_n: int = HERD_N)
                 },
                 "linalg.matmul": {
                     "datatypes": {
-                        "i8": {"macs_per_core_per_cycle": 256, "efficiency": 1},
+                        "i8": {
+                            "macs_per_core_per_cycle": A["macs_i8"],
+                            "efficiency": 1,
+                        },
                         "bf16": {"macs_per_core_per_cycle": 128, "efficiency": 1},
                         "i32": {"macs_per_core_per_cycle": 1, "efficiency": 1},
                     },
@@ -109,11 +170,11 @@ def mmult_runner(air_ir_string: str, herd_m: int = HERD_M, herd_n: int = HERD_N)
             },
         },
         "dus": {
-            "count": [4, 4],
+            "count": A["du_count"],
             "memory": {"memory_space": "L2", "bytes": 524288},
             "ports": {
-                "outbound": {"count": 6, "bytes_per_second": 16000000000},
-                "inbound": {"count": 6, "bytes_per_second": 16000000000},
+                "outbound": {"count": 6, "bytes_per_second": A["du_port_bps"]},
+                "inbound": {"count": 6, "bytes_per_second": A["du_port_bps"]},
             },
             "tiles": {
                 "count": [1, 4],
@@ -125,17 +186,31 @@ def mmult_runner(air_ir_string: str, herd_m: int = HERD_M, herd_n: int = HERD_N)
             },
         },
         "noc": {
-            "outbound": {"count": 8, "bytes_per_second": 16000000000},
-            "inbound": {"count": 8, "bytes_per_second": 16000000000},
+            "outbound": {
+                "count": A["noc_port_count"],
+                "bytes_per_second": A["noc_port_bps"],
+            },
+            "inbound": {
+                "count": A["noc_port_count"],
+                "bytes_per_second": A["noc_port_bps"],
+            },
         },
     }
 
-    runner = air.compiler.util.Runner(arch, "simulation_trace.json", "herd", "single")
+    runner = air.compiler.util.Runner(
+        arch, "simulation_trace.json", A["granularity"], "single"
+    )
     trace = runner.run(air_module, "matmul_bf16")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(prog="mmult_aie2.py")
+    parser = argparse.ArgumentParser(prog="mmult.py")
+    parser.add_argument(
+        "--arch",
+        choices=sorted(ARCH),
+        required=True,
+        help="Target architecture; selects the model parameters in ARCH",
+    )
     parser.add_argument(
         "--input-file",
         default="input.mlir",
@@ -145,8 +220,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--herd-m",
         type=int,
-        default=HERD_M,
-        help="Number of L1 tiles along the M dimension",
+        default=None,
+        help="Number of L1 tiles along the M dimension (default: per --arch)",
     )
     parser.add_argument(
         "--herd-n",
@@ -165,5 +240,8 @@ if __name__ == "__main__":
     # invokes this script bare), so no recorded figure was affected -- the defect was
     # latent, waiting for the first hand-run sweep.
     latency = mmult_runner(
-        air_ir_string=air_ir_string, herd_m=opts.herd_m, herd_n=opts.herd_n
+        air_ir_string=air_ir_string,
+        arch_name=opts.arch,
+        herd_m=opts.herd_m,
+        herd_n=opts.herd_n,
     )
