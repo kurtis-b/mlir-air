@@ -26,12 +26,22 @@ transpose to (in, out). Biases are (out,) and need no transpose.
 """
 
 import os
-import glob as glob_module
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
 import numpy as np
 from ml_dtypes import bfloat16
+
+import sys
+
+_LLMS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _LLMS_DIR not in sys.path:
+    sys.path.insert(0, _LLMS_DIR)
+
+from shared.infra.weights_io import (  # noqa: E402
+    load_tensor as _load_tensor,
+    resolve_safetensor_files as _resolve_safetensor_files,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -153,45 +163,6 @@ _CONNECTOR_KEY = (
 # ---------------------------------------------------------------------------
 # Safetensors loading helpers (mirror the backbone loader)
 # ---------------------------------------------------------------------------
-
-
-def _resolve_safetensor_files(model_path: str) -> List[str]:
-    if os.path.isdir(model_path):
-        files = sorted(glob_module.glob(os.path.join(model_path, "*.safetensors")))
-        if not files:
-            raise FileNotFoundError(f"No .safetensors files found in {model_path}")
-        return files
-
-    from huggingface_hub import snapshot_download
-    from huggingface_hub.errors import LocalEntryNotFoundError
-
-    try:
-        local_dir = snapshot_download(
-            model_path,
-            allow_patterns=["*.safetensors", "*.json"],
-            local_files_only=True,
-        )
-        if not glob_module.glob(os.path.join(local_dir, "*.safetensors")):
-            raise LocalEntryNotFoundError(
-                f"local cache for {model_path} has no .safetensors"
-            )
-    except LocalEntryNotFoundError:
-        local_dir = snapshot_download(
-            model_path, allow_patterns=["*.safetensors", "*.json"]
-        )
-    files = sorted(glob_module.glob(os.path.join(local_dir, "*.safetensors")))
-    if not files:
-        raise FileNotFoundError(
-            f"No .safetensors files found after downloading {model_path}"
-        )
-    return files
-
-
-def _load_tensor(file_handle, key: str, dtype) -> np.ndarray:
-    tensor = file_handle.get_tensor(key)
-    if hasattr(tensor, "numpy"):
-        tensor = tensor.numpy()
-    return tensor.astype(dtype)
 
 
 def _check_shape(name: str, arr: np.ndarray, expected: tuple) -> None:
