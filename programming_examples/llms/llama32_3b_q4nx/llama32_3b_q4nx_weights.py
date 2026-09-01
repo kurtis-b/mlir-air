@@ -32,20 +32,7 @@ from llama32_3b_weights import (  # noqa: E402
     LlamaWeights,
 )
 
-
-def _proj_dims(c):
-    """Logical (out, K) per projection, for I8-packed Q4NX headers."""
-    dq = c.n_heads * c.head_dim
-    dkv = c.n_kv_heads * c.head_dim
-    return {
-        "q": (dq, c.emb_dim),
-        "k": (dkv, c.emb_dim),
-        "v": (dkv, c.emb_dim),
-        "o": (c.emb_dim, dq),
-        "gate": (c.hidden_dim, c.emb_dim),
-        "up": (c.hidden_dim, c.emb_dim),
-        "down": (c.emb_dim, c.hidden_dim),
-    }
+from shared.infra.q4nx import proj_dims as _proj_dims  # noqa: E402
 
 
 def load_q4nx_weights(model_source, config=None):
