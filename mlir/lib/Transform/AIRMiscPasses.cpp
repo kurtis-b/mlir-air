@@ -2573,7 +2573,6 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
       return numOffsets;
     };
 
-
     bool splitIsExpressible = true;
     std::string declineReason;
     auto decline = [&declineReason, &splitIsExpressible]() {

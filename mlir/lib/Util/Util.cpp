@@ -2228,8 +2228,9 @@ getShrinkageOffsetUpperBound(Value offset, bool sweepFoldedIntoSizes,
 // one transfer move"; a buffer sized to that is too small once two transfers
 // land at different offsets). Sets `bounded` false if an offset could not be
 // bounded; the caller must then not shrink.
-// Internal to this file: the only callers are the getDataAccessShapeFromMemcpyOp
-// overloads below. Not declared in Util.h -- see the note there.
+// Internal to this file: the only callers are the
+// getDataAccessShapeFromMemcpyOp overloads below, so it is deliberately absent
+// from Util.h.
 static SmallVector<int64_t> getEffectiveMemrefExtentFromAccessPattern(
     SmallVector<int> memref_shape, SmallVector<Value> offsets,
     SmallVector<Value> sizes, SmallVector<Value> strides,
