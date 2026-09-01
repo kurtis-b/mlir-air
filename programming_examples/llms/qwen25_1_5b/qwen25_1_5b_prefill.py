@@ -56,7 +56,7 @@ if _LLMS_DIR not in sys.path:
     sys.path.insert(0, _LLMS_DIR)
 
 from qwen25_1_5b_weights import LlamaConfig
-from qwen25_1_5b_cpu_helpers import attention_reference
+from shared.infra.cpu_attn import attention_reference
 
 # ---------------------------------------------------------------------------
 # Generic per-GEMM spec + IR builder. Supports the three bf16-out methods the

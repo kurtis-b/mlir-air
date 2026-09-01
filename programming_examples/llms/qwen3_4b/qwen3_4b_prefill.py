@@ -67,7 +67,7 @@ if _LLMS_DIR not in sys.path:
     sys.path.insert(0, _LLMS_DIR)
 
 from qwen3_4b_weights import LlamaConfig
-from qwen3_4b_cpu_helpers import attention_reference
+from shared.infra.cpu_attn import attention_reference
 
 # ---------------------------------------------------------------------------
 # GEMM method/tile spec — REGISTRY-DRIVEN. Every qwen3_4b prefill GEMM now

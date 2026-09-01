@@ -46,7 +46,8 @@ for p in (_PROG_EXAMPLES, _LLAMA_BF16, str(_THIS_DIR)):
         sys.path.insert(0, p)
 
 from llama32_1b_weights import LlamaConfig, generate_rope_lut
-from llama32_1b_cpu_helpers import rms_norm, attention_reference
+from llama32_1b_cpu_helpers import rms_norm
+from shared.infra.cpu_attn import attention_reference
 from shared.infra import cache as _cache_mod
 from shared.infra.cache import KernelCache, Profiler
 from shared.infra.external_kernels import (

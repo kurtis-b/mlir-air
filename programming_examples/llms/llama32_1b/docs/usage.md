@@ -202,7 +202,7 @@ llama32_1b/
 ├── llama32_1b_prefill.py               ← Prefill-only pipeline
 ├── llama32_1b_decode.py                ← Decode-only pipeline
 ├── llama32_1b_weights.py               ← Weight loading from safetensors
-├── llama32_1b_cpu_helpers.py           ← Small NumPy helpers: rms_norm, attention_reference, softmax
+├── llama32_1b_cpu_helpers.py           ← Small NumPy helpers: rms_norm (attention_reference: shared/infra/cpu_attn.py)
 │
 ├── gemm_builder.py                 ← bf16 GEMM module builder + transform IR
 │
