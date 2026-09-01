@@ -171,7 +171,7 @@ and why. Use the structure below:
 | `make verify` returns PASS suspiciously fast (<10 s for a full N-layer model) | Token count too low, or NpuRunner not actually invoking kernels | Check the shared `verify_runner.py` GATE_N_TOKENS + the model's NpuRunner generates 32 tokens through the real prefill/decode |
 | Subagent reads LESSONS/progress before measuring | Skill prompt wasn't strict enough | Reject the report; re-spawn with stricter instructions |
 
-For any failure not in the table, invoke `superpowers:systematic-debugging`.
+For any failure not in the table, use the systematic-debugging fallback: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO.
 
 ## Update protocol
 

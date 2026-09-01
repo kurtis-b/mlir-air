@@ -229,7 +229,7 @@ time (use `<model>_cpu_helpers.py` for the ops that have a helper —
 walk forward through the block, replacing `npu_<kernel>(...)` with the CPU
 equivalent, recompute cosine. The first replacement that pushes cosine
 above threshold identifies the offender — that's where the layout / type /
-argument mismatch lives. Invoke `superpowers:systematic-debugging` on it.
+argument mismatch lives. Debug it systematically from there: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO.
 
 Record the bisect table (per-step cosine) in `phase2_block.md` so future
 deployments learn from this specific failure.
@@ -245,7 +245,7 @@ deployments learn from this specific failure.
 | Cosine drops at residual add | bias forgotten on padded path / GQA reindex bug | If padding+bias model: re-run CPU sanity test on padded forward (Step 2) |
 | Whole-tensor cosine OK but per-position min low | one bad position run; check whether last few positions diverge (causal mask edge case) | Print per-position cosine, look for contiguous bad runs |
 
-For any failure not in the table, invoke `superpowers:systematic-debugging`.
+For any failure not in the table, use the systematic-debugging fallback: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO.
 
 ## Update protocol
 

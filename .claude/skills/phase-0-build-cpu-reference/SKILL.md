@@ -194,7 +194,7 @@ not run here — Phase 2/3 own that comparison against NPU output.)
 | `HfRunner.prefill` returns NaN logits | dtype/precision issue in HF load, or a corrupt download | Re-download the HF snapshot; confirm `torch_dtype=bfloat16` path |
 | top-1 token looks nonsensical | tokenizer mismatch (wrong chat template / BOS handling) | Confirm tokenizer matches the model; check base vs instruct prompt set |
 
-For any failure not in the table, invoke `superpowers:systematic-debugging`.
+For any failure not in the table, use the systematic-debugging fallback: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO.
 
 (Per-layer cosine drops — RoPE convention, norm order, KV layout — are no
 longer a Phase 0 concern; they surface in Phase 2/3 when NPU output is

@@ -75,7 +75,7 @@ modes, invoke `debug-fa-runtime-failure`.
 | FA hang (`ERT_CMD_STATE_TIMEOUT`) or NaN at head_dim ≥ 128 | seq-first `dk_chunks > 1` path bug | Route through the head-first wrapper; invoke `debug-fa-runtime-failure` |
 | Transpose removed but no wall-time gain | the transpose wasn't on the hot path | Document; revert or keep for cleanliness |
 
-For any failure not in the table, invoke `superpowers:systematic-debugging`.
+For any failure not in the table, use the systematic-debugging fallback: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO.
 
 ## Update protocol
 

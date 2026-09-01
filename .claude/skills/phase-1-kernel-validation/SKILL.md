@@ -233,7 +233,7 @@ placeability section) is the authority for that kernel's hard limits.
 | FA all-NaN at runtime | Compile-flag mismatch on `attn_npu2.cc` macros; OR seq-first `dk_chunks>1` path at head_dim≥128 | see `debug-fa-runtime-failure` skill |
 | Compile hangs > 10 min | Compiler scaling issue at large multi-launch | Cap and document; don't retry |
 
-For any failure not in the table, invoke `superpowers:systematic-debugging`.
+For any failure not in the table, use the systematic-debugging fallback: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO.
 
 ## Update protocol
 

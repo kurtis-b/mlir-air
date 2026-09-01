@@ -37,8 +37,8 @@ This skill matches when ANY of these appear in `aircc.py` stderr:
 - `stride must be 1` for BF16 / sub-32b types
 
 If your error doesn't match any of these patterns, the issue is likely
-NOT a multi-launch resource collision — invoke
-`superpowers:systematic-debugging` instead.
+NOT a multi-launch resource collision — fall back to systematic debugging
+instead: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO.
 
 ## Diagnostic hypothesis tree
 
