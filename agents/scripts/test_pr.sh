@@ -174,9 +174,12 @@ check "P1 wins over a claimed PASS" "BLOCK" "$(verdict_of $'- [P1] x\nVERDICT: P
 
 echo "--- materialize_base_instructions: deletions and symlinks on the head cannot escape the base policy ---"
 REPO="$FAKE/repo"; git init -q -b main "$REPO" || { echo "FAIL  fixture: git init"; exit 1; }
-( cd "$REPO" && printf 'BASE POLICY\n' > AGENTS.md && mkdir -p .codex sub && printf 'base codex\n' > .codex/config.toml \
-  && printf 'nested base\n' > sub/AGENTS.md && git add -A && git commit -q -m base && git branch -q base-ref \
+( cd "$REPO" && printf 'BASE POLICY\n' > AGENTS.md && mkdir -p .codex sub .claude/skills/demo && printf 'base codex\n' > .codex/config.toml \
+  && printf 'nested base\n' > sub/AGENTS.md && printf 'base skill\n' > .claude/skills/demo/SKILL.md \
+  && git add -A && git commit -q -m base && git branch -q base-ref \
   && git rm -q AGENTS.md sub/AGENTS.md && rm -rf .codex && printf 'victim\n' > "$FAKE/victim" \
+  && printf 'head skill\n' > .claude/skills/demo/SKILL.md && mkdir -p .claude/skills/added \
+  && printf 'head added\n' > .claude/skills/added/SKILL.md \
   && ln -s "$FAKE/victim" CLAUDE.md && ln -s "$FAKE" .codex && git add -A && git commit -q -m head )
 WT="$FAKE/wt"; git -C "$REPO" worktree add -q --detach "$WT" HEAD
 materialize_base_instructions "$WT" base-ref
@@ -184,6 +187,8 @@ check "deleted root AGENTS.md restored from base" "BASE POLICY" "$(cat "$WT/AGEN
 check "deleted nested AGENTS.md restored from base" "nested base" "$(cat "$WT/sub/AGENTS.md" 2>/dev/null)"
 check "deleted .codex config restored from base" "base codex" "$(cat "$WT/.codex/config.toml" 2>/dev/null)"
 check ".codex is a real directory, not the head's symlink" "dir" "$([ -d "$WT/.codex" ] && [ ! -L "$WT/.codex" ] && echo dir)"
+check "head-edited .claude/skills SKILL.md restored from base" "base skill" "$(cat "$WT/.claude/skills/demo/SKILL.md" 2>/dev/null)"
+check "head-added .claude/skills entry absent on base is removed" "absent" "$([ ! -e "$WT/.claude/skills/added/SKILL.md" ] && echo absent)"
 check "symlinked CLAUDE.md removed without touching its target" "victim" "$(cat "$FAKE/victim")"
 check "CLAUDE.md absent on base stays absent" "absent" "$([ ! -e "$WT/CLAUDE.md" ] && echo absent)"
 
