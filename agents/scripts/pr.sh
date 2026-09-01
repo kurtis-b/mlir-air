@@ -180,7 +180,9 @@ trusted_exec() { # trusted_exec <argv...>
 }
 
 # Codex loads AGENTS.md / AGENTS.override.md (root and nested), CLAUDE.md and .codex/ from the
-# tree it runs in. In a
+# tree it runs in. .claude/skills/ joins them because the instruction chain reaches it by
+# reference — AGENTS.md names it the canonical home of the skill guides that .codex/ mirrors — so
+# a review that follows the chain reads it. In a
 # review worktree those must be the *base's* versions, or a PR could weaken the instructions it
 # is reviewed under (its edits to them are still visible in the diff). For the union of matching
 # paths on base and head: remove the head's path without following symlinks, then restore the
@@ -188,8 +190,8 @@ trusted_exec() { # trusted_exec <argv...>
 instruction_paths() { # instruction_paths <worktree> <base-ref> -> newline-separated union
   local wt="$1" base="$2"
   {
-    git -C "$wt" ls-files -- 'AGENTS.md' '*/AGENTS.md' 'AGENTS.override.md' '*/AGENTS.override.md' 'CLAUDE.md' '*/CLAUDE.md' '.codex' '.codex/**' 2>/dev/null || true
-    git -C "$wt" ls-tree -r --name-only "$base" 2>/dev/null | grep -E '(^|/)(AGENTS|AGENTS\.override|CLAUDE)\.md$|^\.codex(/|$)' || true
+    git -C "$wt" ls-files -- 'AGENTS.md' '*/AGENTS.md' 'AGENTS.override.md' '*/AGENTS.override.md' 'CLAUDE.md' '*/CLAUDE.md' '.codex' '.codex/**' '.claude/skills' '.claude/skills/**' 2>/dev/null || true
+    git -C "$wt" ls-tree -r --name-only "$base" 2>/dev/null | grep -E '(^|/)(AGENTS|AGENTS\.override|CLAUDE)\.md$|^\.codex(/|$)|^\.claude/skills(/|$)' || true
   } | sort -u
 }
 # Replace every symlinked component of <worktree>/<path> (including the leaf) with nothing, so a
