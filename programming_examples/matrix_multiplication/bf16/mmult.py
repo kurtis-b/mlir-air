@@ -19,6 +19,20 @@ import re
 # Per-architecture model parameters. These were two near-identical files
 # (mmult_aie2.py / mmult_aie2p.py) differing only in the values below; the
 # numbers are carried over verbatim from each.
+#
+# Changing anything here changes a reported latency, so verify a change the way
+# the merge itself was verified -- on two signals, not one:
+#
+#   python3 run.py -p --arch <a> --m 512 --k 512 --n 512 --herd-m 2 --herd-n 2 > in.mlir
+#   python3 mmult.py --arch <a> --input-file in.mlir      # printed latency
+#   md5sum air_ir_debug.mlir                              # placed IR
+#
+# The placed-IR hash catches a change that disturbs the pass pipeline; the
+# latency catches a transposed cost value, which the hash alone would not.
+# Recorded for the inputs above at the time of the merge:
+#
+#   aie2   570.464us   air_ir_debug.mlir ddaa02b8a87dcff2d8418a9c596f7e2c
+#   aie2p  1102.84us   air_ir_debug.mlir b664b14b8520f0b1d3c7b0b3c2351a69
 ARCH = {
     "aie2": {
         "herd_m": 4,
