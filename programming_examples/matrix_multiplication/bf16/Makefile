@@ -59,12 +59,10 @@ ifeq ($(AIE_TARGET),aie2p)
   PEANO_FLAGS = ${PEANOWRAP2P_FLAGS}
   MAX_HERD_M = 8
   MAX_HERD_N = 4
-  RUNNER_SCRIPT = mmult_aie2p.py
 else
   PEANO_FLAGS = ${PEANOWRAP2_FLAGS}
   MAX_HERD_M = 4
   MAX_HERD_N = 4
-  RUNNER_SCRIPT = mmult_aie2.py
 endif
 
 all: run4x4
@@ -155,7 +153,7 @@ profile: compile-kernel build-test-exe
 runner:
 	mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && python ${srcdir}/run.py --herd-m $(MAX_HERD_M) --herd-n $(MAX_HERD_N) --m 1024 --k 512 --n 512 --tile-m $(TILE_M) --tile-k-l2 $(TILE_K_L2) --tile-k-l1 $(TILE_K_L1) --tile-n $(TILE_N) --arch $(AIE_TARGET) -p > input.mlir
-	cd $(BUILD_DIR) && python ${srcdir}/$(RUNNER_SCRIPT)
+	cd $(BUILD_DIR) && python ${srcdir}/mmult.py --arch $(AIE_TARGET)
 
 # Measure the e2e latencies across a range of problem shapes.
 sweep4x4: compile-kernel build-test-exe

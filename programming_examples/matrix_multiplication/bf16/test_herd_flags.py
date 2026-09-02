@@ -34,43 +34,54 @@ def _input_ir(arch):
     return out
 
 
-def _placed_sizes(script, ir_path, herd_args):
+def _placed_sizes(arch, ir_path, herd_args):
     """Run the runner CLI in a temp cwd; return the placed segment x/y sizes."""
     d = tempfile.mkdtemp()
-    cmd = [sys.executable, os.path.join(_HERE, script), "--input-file", ir_path]
+    cmd = [
+        sys.executable,
+        os.path.join(_HERE, "mmult.py"),
+        "--arch",
+        arch,
+        "--input-file",
+        ir_path,
+    ]
     r = subprocess.run(
         cmd + herd_args, cwd=d, capture_output=True, timeout=600, text=True
     )
     assert r.returncode == 0, (
-        f"{script}: exited {r.returncode}; the runner must complete, not just place. "
+        f"mmult.py --arch {arch}: exited {r.returncode}; the runner must complete, not just place. "
         f"stderr tail: {r.stderr.strip().splitlines()[-1] if r.stderr.strip() else '(empty)'}"
     )
     debug = os.path.join(d, "air_ir_debug.mlir")
-    assert os.path.exists(debug), f"{script}: no air_ir_debug.mlir (died pre-placement)"
+    assert os.path.exists(
+        debug
+    ), f"mmult.py --arch {arch}: no air_ir_debug.mlir (died pre-placement)"
     with open(debug) as f:
         m = _SIZES.search(f.read())
-    assert m, f"{script}: no placed segment attributes in air_ir_debug.mlir"
+    assert (
+        m
+    ), f"mmult.py --arch {arch}: no placed segment attributes in air_ir_debug.mlir"
     return int(m.group(1)), int(m.group(2))
 
 
 def main():
     n_pass = 0
-    for script, arch, dflt in (
-        ("mmult_aie2.py", "aie2", (4, 4)),
-        ("mmult_aie2p.py", "aie2p", (8, 4)),
-    ):
+    for arch, dflt in (("aie2", (4, 4)), ("aie2p", (8, 4))):
         f = tempfile.NamedTemporaryFile("w", suffix=".mlir", delete=False)
         f.write(_input_ir(arch))
         f.close()
-        x, y = _placed_sizes(script, f.name, ["--herd-m", "2", "--herd-n", "2"])
+        x, y = _placed_sizes(arch, f.name, ["--herd-m", "2", "--herd-n", "2"])
         assert (x, y) == (2, 2), (
-            f"{script}: --herd-m 2 --herd-n 2 placed a {x}x{y} segment -- "
+            f"mmult.py --arch {arch}: --herd-m 2 --herd-n 2 placed a {x}x{y} segment -- "
             "the flags are parsed but no longer reach the placer"
         )
-        xd, yd = _placed_sizes(script, f.name, [])
-        assert (xd, yd) == dflt, f"{script}: default placement changed: {xd}x{yd}"
+        xd, yd = _placed_sizes(arch, f.name, [])
+        assert (
+            xd,
+            yd,
+        ) == dflt, f"mmult.py --arch {arch}: default placement changed: {xd}x{yd}"
         print(
-            f"PASS  {script}: herd flags reach the placer (2x2), default intact ({xd}x{yd})"
+            f"PASS  mmult.py --arch {arch}: herd flags reach the placer (2x2), default intact ({xd}x{yd})"
         )
         n_pass += 1
     print(f"mmult herd-flag tests: {n_pass}/2 passed")
