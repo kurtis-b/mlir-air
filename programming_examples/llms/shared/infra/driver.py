@@ -32,12 +32,20 @@ here: qwen3_0_6b/1_7b's `run_decode_block` returns a bare `x`, while the other
 four return `(out, inter)`. That is an API difference, not a spelling, so
 sharing it needs the callee normalised first — a separate change.
 
-Gating a change here — the recipe, because the obvious gate does not work.
-None of this is reached from `verify_adapter.py`; it hangs off each model's CLI
-`main`, so `make verify` passes whatever these functions do. The signal is
-`make run N_TOKENS=16`, whose greedy (argmax) decode is deterministic: capture
-its output before and after with timings and throughput stripped, and the
-generated token ids must be unchanged. Baseline twice before trusting it.
+Gating a change here — and WHICH gate depends on the function.
+
+`build_session`, `run_once`, `repl_loop`, `tokenize_prompt` and `generate` hang
+off each model's CLI `main` and are NOT reached from `verify_adapter.py`, so
+`make verify` passes whatever they do. Their signal is `make run N_TOKENS=16`,
+whose greedy (argmax) decode is deterministic: capture its output before and
+after with timings and throughput stripped; the generated token ids must be
+unchanged. Baseline twice before trusting it.
+
+`run_npu_prefill` is different and must be gated differently: every model's
+`verify_adapter.py` imports it and `verify/runners/bf16_npu_runner.py` calls it
+from `prefill()`. So `make verify` DOES reach it — and is the stronger check
+there, because the top-k token-set gate sees changes in non-top-1 logits that an
+argmax comparison cannot. Run both for this function.
 
 Measured on 2026-09-04, per consolidation, all under Turbo, all rc=0:
 
@@ -45,6 +53,14 @@ Measured on 2026-09-04, per consolidation, all under Turbo, all rc=0:
     REPL trio      (devq 916 baseline,     917 after)   3/3 models identical
     generate path  (devq 918 baseline,     919 after)   3/3 models identical
     run_npu_prefill(devq 920 baseline,     921 after)   3/3 models identical
+                   (devq 922 before,       923 after)   `make verify` PASS both
+                                                        sides, topk_passed 2 /
+                                                        topk_failed 0, on
+                                                        qwen3_0_6b AND
+                                                        qwen25_0_5b — one per
+                                                        config family, so both
+                                                        injected transformer
+                                                        blocks are covered
 
 Each baseline reproduced its predecessor byte-for-byte (913 == 914 == 916 == 918
 == 920),
