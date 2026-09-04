@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from qwen25_1_5b_weights import LlamaConfig, load_weights, generate_rope_lut
 from qwen25_1_5b_cpu_helpers import rms_norm
-from shared.infra.cache import KernelCache, Profiler
+from shared.infra.driver import build_session as _build_session
 from qwen25_1_5b_prefill import (
     compile_all_kernels,
     run_transformer_block_qwen25,
@@ -558,61 +558,17 @@ MODEL_CHOICES = {"base": "Qwen/Qwen2.5-1.5B", "instruct": "Qwen/Qwen2.5-1.5B-Ins
 
 
 def build_session(args) -> Session:
-    config = LlamaConfig()
-    seq_len = 2048
-
-    prefill_cache = KernelCache(
-        "prefill_kernel_cache",
-        verbose=args.verbose,
-        profiler=Profiler(enabled=args.profile),
-    )
-    decode_cache = KernelCache(
-        "decode_kernel_cache",
-        verbose=args.verbose,
-        profiler=Profiler(enabled=args.profile),
-    )
-
-    if not args.run_only:
-        print("Compiling prefill kernels...")
-        compile_all_kernels(
-            prefill_cache, config, seq_len, verbose=args.verbose, cpu_attn=args.cpu_attn
-        )
-        print("\nCompiling decode kernels...")
-        compile_decode_kernels(decode_cache, config, verbose=args.verbose)
-
-    if args.compile_only:
-        print("\nCompilation passed.")
-        sys.exit(0)
-
-    if args.run_only:
-        prefill_cache.load_manifest()
-        decode_cache.load_manifest()
-
-    model_id = MODEL_CHOICES.get(args.model, args.model)
-    print(f"\nLoading weights ({model_id})...")
-    weights = load_weights(model_id, config=config)
-
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-    rope_lut_bf16 = generate_rope_lut(
-        config=config, seq_len=seq_len + args.n_tokens
-    ).astype(bfloat16)
-
-    prepare_runtime(
-        prefill_cache, decode_cache, weights, config, seq_len, rope_lut_bf16
-    )
-
-    return Session(
-        config=config,
-        seq_len=seq_len,
-        weights=weights,
-        tokenizer=tokenizer,
-        prefill_cache=prefill_cache,
-        decode_cache=decode_cache,
-        rope_lut_bf16=rope_lut_bf16,
-        model_variant=args.model,
+    """Build this model's Session through the shared driver."""
+    return _build_session(
+        args,
+        config_cls=LlamaConfig,
+        session_cls=Session,
+        model_choices=MODEL_CHOICES,
+        load_weights=load_weights,
+        generate_rope_lut=generate_rope_lut,
+        compile_all_kernels=compile_all_kernels,
+        compile_decode_kernels=compile_decode_kernels,
+        prepare_runtime=prepare_runtime,
     )
 
 
