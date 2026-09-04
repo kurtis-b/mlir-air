@@ -30,7 +30,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from qwen3_0_6b_weights import LlamaConfig, load_weights, generate_rope_lut
 from qwen3_0_6b_cpu_helpers import rms_norm
-from shared.infra.driver import build_session as _build_session
+from shared.infra.driver import (  # noqa: F401
+    build_session as _build_session,
+    repl_loop as _shared_repl_loop,
+    run_once as _shared_run_once,
+    tokenize_prompt as _tokenize_prompt,
+)
 from qwen3_0_6b_prefill import (
     compile_all_kernels,
     run_transformer_block_qwen3,
@@ -589,43 +594,14 @@ def build_session(args) -> Session:
     )
 
 
-def _tokenize_prompt(session: Session, prompt_text: str) -> list:
-    if session.model_variant == "instruct":
-        messages = [{"role": "user", "content": prompt_text}]
-        chat_text = session.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        return session.tokenizer.encode(chat_text)
-    return session.tokenizer.encode(prompt_text)
+def run_once(session, prompt_text, **kw):
+    """This model's `generate`, through the shared driver."""
+    return _shared_run_once(session, prompt_text, generate=generate, **kw)
 
 
-def run_once(
-    session, prompt_text, *, n_tokens, profile=False, cpu_attn=True, on_token=None
-):
-    ttft_start = time.perf_counter()
-    with session.prefill_cache.profiler.time_cpu("tokenize"):
-        tokens = _tokenize_prompt(session, prompt_text)
-    prompt_len_actual = len(tokens)
-    with session.prefill_cache.profiler.time_cpu("eos_pad"):
-        if len(tokens) < session.seq_len:
-            tokens = tokens + [session.tokenizer.eos_token_id] * (
-                session.seq_len - len(tokens)
-            )
-    generated = generate(
-        tokens,
-        session.weights,
-        session.config,
-        session.prefill_cache,
-        session.decode_cache,
-        session.rope_lut_bf16,
-        tokenizer=session.tokenizer,
-        n_tokens=n_tokens,
-        profile=profile,
-        cpu_attn=cpu_attn,
-        on_token=on_token,
-        ttft_start=ttft_start,
-    )
-    return generated, prompt_len_actual
+def repl_loop(session, args):
+    """This model's `generate`, through the shared driver."""
+    _shared_repl_loop(session, args, generate=generate)
 
 
 def _print_one_shot_output(session, prompt_text, generated, prompt_len_actual):
@@ -639,40 +615,6 @@ def _print_one_shot_output(session, prompt_text, generated, prompt_len_actual):
         all_tokens = prompt_tokens[:prompt_len_actual] + generated
         print("Generated text:")
         print(session.tokenizer.decode(all_tokens))
-
-
-def repl_loop(session, args):
-    print("\nInteractive mode — Ctrl-D or /quit to exit.\n")
-
-    def _cb(_tid, delta):
-        sys.stdout.write(delta)
-        sys.stdout.flush()
-
-    while True:
-        try:
-            prompt = input("Prompt> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if not prompt:
-            continue
-        if prompt in ("/quit", "/exit"):
-            return
-        sys.stdout.write("\nResponse: ")
-        sys.stdout.flush()
-        try:
-            run_once(
-                session,
-                prompt,
-                n_tokens=args.n_tokens,
-                profile=False,
-                cpu_attn=args.cpu_attn,
-                on_token=_cb,
-            )
-        except KeyboardInterrupt:
-            print("\n[interrupted]")
-            continue
-        print("\n")
 
 
 if __name__ == "__main__":
