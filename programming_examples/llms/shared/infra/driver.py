@@ -17,11 +17,20 @@ passed in — goal 6c's injection contract.
                                              run_npu_decode_step, plus `label`
     StreamState        6 copies,  18 lines   nothing
     delta_text         6 copies,  30 lines   nothing
+    run_npu_prefill    6 copies, 474 lines   this model's transformer block,
+                                             rms_norm, LM-head and eps
 
 `generate`'s six copies hashed as two bodies, but the two differ by exactly one
 line — the banner string — so `label` is a parameter and the rest is shared.
-`run_npu_prefill` (3 distinct implementations across the six) and
-`run_npu_decode_step` (2) are genuinely per-model and stay injected.
+`run_npu_prefill` hashed as THREE bodies and was described here as "genuinely
+per-model"; that was wrong, and reading the diff is what showed it: the three
+differ only in a docstring, in the local name given to `inter["v"]`, and in
+which `run_transformer_block_*` they call. One handle, not three implementations.
+
+`run_npu_decode_step` really does stay per-model, and for a reason worth keeping
+here: qwen3_0_6b/1_7b's `run_decode_block` returns a bare `x`, while the other
+four return `(out, inter)`. That is an API difference, not a spelling, so
+sharing it needs the callee normalised first — a separate change.
 
 Gating a change here — the recipe, because the obvious gate does not work.
 None of this is reached from `verify_adapter.py`; it hangs off each model's CLI
@@ -35,8 +44,10 @@ Measured on 2026-09-04, per consolidation, all under Turbo, all rc=0:
     build_session  (devq 913/914 baseline, 915 after)   3/3 models identical
     REPL trio      (devq 916 baseline,     917 after)   3/3 models identical
     generate path  (devq 918 baseline,     919 after)   3/3 models identical
+    run_npu_prefill(devq 920 baseline,     921 after)   3/3 models identical
 
-Each baseline reproduced its predecessor byte-for-byte (913 == 914 == 916 == 918),
+Each baseline reproduced its predecessor byte-for-byte (913 == 914 == 916 == 918
+== 920),
 so an unchanged result is a real signal and not a fixture that never varies. The
 `generate` banner is printed output, so that run also checks the `label` wiring
 directly: 919 shows `Qwen3 Inference:` for the qwen3 models and `Qwen2.5
@@ -53,6 +64,7 @@ interactive: the REPL's guard is its host tests, which script stdin.
 import sys
 import time
 
+import numpy as np
 from ml_dtypes import bfloat16
 
 from shared.infra.cache import KernelCache, Profiler
@@ -343,3 +355,98 @@ def generate(
         decode_cache.profiler.report()
 
     return generated_tokens
+
+
+def run_npu_prefill(
+    token_ids,
+    weights,
+    config,
+    prefill_cache,
+    decode_cache,
+    rope_lut_bf16,
+    max_seq,
+    tokenizer,
+    cpu_attn=True,
+    profile=False,
+    quiet=False,
+    *,
+    run_transformer_block,
+    rms_norm,
+    run_lm_head,
+    eps,
+):
+    """NPU prefill over every layer, then the KV cache and the first token.
+
+    Returns (prefill_token, logits_row, k_cache, v_cache, prompt_len).
+
+    The caches hold whatever this model's transformer block produced: `k_roped`
+    after the block's RoPE, and `inter["v"]` — which is the bias-added
+    projection for Qwen2.5 and the raw projection for Qwen3. That difference
+    lives in `run_transformer_block`, not here, which is why the six copies of
+    this function differed only in the handle they called and in the local name
+    they gave that value.
+
+    `eps` is passed explicitly, never defaulted: it is per-model config (1e-6
+    across all six callers today) and a shared default is exactly how a wrong
+    epsilon reaches a verify path unnoticed.
+    """
+    seq_len = len(token_ids)
+    n_kv_heads = config.n_kv_heads
+    head_dim = config.head_dim
+    vocab_size = weights.lm_head.shape[0]
+
+    k_cache = np.zeros((config.n_layers, n_kv_heads, max_seq, head_dim), dtype=bfloat16)
+    v_cache = np.zeros((config.n_layers, n_kv_heads, max_seq, head_dim), dtype=bfloat16)
+
+    with prefill_cache.profiler.time_cpu("embed_lookup"):
+        x_bf16 = weights.embed_table[token_ids].astype(np.float32).astype(bfloat16)
+
+    if not quiet:
+        print(f"Running NPU prefill ({config.n_layers} layers, seq_len={seq_len})...")
+    t_start = time.time()
+
+    for layer_idx in range(config.n_layers):
+        t0 = prefill_cache.profiler.start_layer()
+        x_bf16, inter = run_transformer_block(
+            x_bf16,
+            weights.layers[layer_idx],
+            rope_lut_bf16,
+            config,
+            prefill_cache,
+            layer_idx=layer_idx,
+            cpu_attn=cpu_attn,
+            verbose=profile,
+        )
+        with prefill_cache.profiler.time_cpu("kv_cache_extract"):
+            k_roped = inter["k_roped"]
+            v_proj = inter["v"]
+            k_cache[layer_idx, :, :seq_len, :] = (
+                k_roped.astype(bfloat16)
+                .reshape(seq_len, n_kv_heads, head_dim)
+                .transpose(1, 0, 2)
+            )
+            v_cache[layer_idx, :, :seq_len, :] = (
+                v_proj.astype(bfloat16)
+                .reshape(seq_len, n_kv_heads, head_dim)
+                .transpose(1, 0, 2)
+            )
+        prefill_cache.profiler.end_layer(layer_idx, t0)
+
+    # Final RMSNorm on the prediction-position row + NPU LM-head.
+    prompt_len = len([t for t in token_ids if t != tokenizer.eos_token_id])
+    pred_pos = prompt_len - 1
+    with prefill_cache.profiler.time_cpu("final_rms_norm"):
+        last_hidden = np.asarray(x_bf16, dtype=np.float32)[pred_pos : pred_pos + 1]
+        last_normed = (
+            rms_norm(last_hidden, weights.final_norm, eps=eps)
+            .flatten()
+            .astype(bfloat16)
+        )
+
+    logits_row = run_lm_head(decode_cache, weights, last_normed, vocab_size)
+    prefill_token = int(np.argmax(logits_row))
+
+    t_prefill = time.time() - t_start
+    if not quiet:
+        print(f"NPU prefill done in {t_prefill:.2f}s. First token: {prefill_token}")
+    return prefill_token, logits_row, k_cache, v_cache, prompt_len

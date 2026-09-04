@@ -526,5 +526,133 @@ def test_each_shim_binds_its_own_npu_steps_and_the_right_label():
         assert {"run_npu_prefill", "run_npu_decode_step"} <= local, m
 
 
+# --- the prefill path (slice 4) -------------------------------------------
+
+PREFILL_BLOCK = {
+    "qwen25_0_5b": "run_transformer_block_qwen25",
+    "qwen25_1_5b": "run_transformer_block_qwen25",
+    "qwen25_3b": "run_transformer_block_qwen25",
+    "qwen3_0_6b": "run_transformer_block_qwen3",
+    "qwen3_1_7b": "run_transformer_block_qwen3",
+    "qwen3_4b": "run_transformer_block_qwen3",
+}
+
+
+class _PrefProf(_Prof):
+    def start_layer(self):
+        return 0
+
+    def end_layer(self, idx, t0):
+        pass
+
+
+def _prefill_env(n_layers=2, seq=4, eos=99):
+    cfg = SimpleNamespace(n_layers=n_layers, emb_dim=8, n_kv_heads=2, head_dim=3)
+    weights = SimpleNamespace(
+        embed_table=np.zeros((200, 8), dtype=np.float32),
+        layers=[f"L{i}" for i in range(n_layers)],
+        final_norm="FN",
+        lm_head=np.zeros((7, 8)),
+    )
+    seen = {"layers": [], "rms": []}
+
+    def block(
+        x, layer_w, rope, config, cache, layer_idx=None, cpu_attn=None, verbose=None
+    ):
+        seen["layers"].append((layer_w, layer_idx, cpu_attn))
+        inter = {
+            "k_roped": np.full((seq, 2, 3), layer_idx + 1, dtype=np.float32).reshape(
+                seq, 6
+            ),
+            "v": np.full((seq, 2, 3), 100 + layer_idx, dtype=np.float32).reshape(
+                seq, 6
+            ),
+        }
+        return x, inter
+
+    def rms(h, w, eps=None):
+        seen["rms"].append((w, eps))
+        return np.ones((1, 8), dtype=np.float32)
+
+    def lm_head(dc, w, normed, vocab):
+        seen["lm"] = (vocab, normed.dtype)
+        out = np.zeros(vocab)
+        out[3] = 1.0
+        return out
+
+    cache = SimpleNamespace(profiler=_PrefProf())
+    tok = SimpleNamespace(eos_token_id=eos)
+    return cfg, weights, cache, tok, block, rms, lm_head, seen
+
+
+def _run_prefill(eps=1e-6, seq=4, eos=99, pad=0):
+    tokens = [1, 2, 3, 4][:seq] + [eos] * pad
+    # the block sees the PADDED length, as it does in the real driver
+    cfg, weights, cache, tok, block, rms, lm_head, seen = _prefill_env(
+        seq=len(tokens), eos=eos
+    )
+    out = driver.run_npu_prefill(
+        tokens,
+        weights,
+        cfg,
+        cache,
+        cache,
+        "ROPE",
+        len(tokens) + 4,
+        tok,
+        quiet=True,
+        run_transformer_block=block,
+        rms_norm=rms,
+        run_lm_head=lm_head,
+        eps=eps,
+    )
+    return out, seen
+
+
+def test_prefill_returns_argmax_token_and_the_filled_caches():
+    (token, logits, k_cache, v_cache, prompt_len), seen = _run_prefill()
+    assert token == 3, token
+    assert prompt_len == 4, prompt_len
+    assert k_cache.shape == (2, 2, 8, 3) and k_cache.dtype == bfloat16, k_cache.shape
+    # layer 0 wrote 1s into k and 100s into v; layer 1 wrote 2s and 101s
+    assert float(k_cache[0, 0, 0, 0]) == 1.0 and float(k_cache[1, 0, 0, 0]) == 2.0
+    assert float(v_cache[0, 0, 0, 0]) == 100.0 and float(v_cache[1, 0, 0, 0]) == 101.0
+    assert [i for _, i, _ in seen["layers"]] == [0, 1], seen["layers"]
+    assert [w for w, _, _ in seen["layers"]] == ["L0", "L1"], seen["layers"]
+
+
+def test_prefill_passes_the_models_eps_through_verbatim():
+    _, seen = _run_prefill(eps=1e-5)
+    assert seen["rms"] == [("FN", 1e-5)], seen["rms"]
+
+
+def test_prompt_len_ignores_eos_padding():
+    (_, _, _, _, prompt_len), _ = _run_prefill(seq=4, pad=6)
+    assert prompt_len == 4, prompt_len
+
+
+def test_each_shim_binds_its_own_transformer_block_and_eps():
+    for m, block in PREFILL_BLOCK.items():
+        tree = ast.parse((_LLMS / m / f"{m}_inference.py").read_text())
+        fn = [
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "run_npu_prefill"
+        ]
+        assert len(fn) == 1, m
+        call = [n for n in ast.walk(fn[0]) if isinstance(n, ast.Call)][0]
+        kw = {k.arg: k.value for k in call.keywords}
+        assert None in kw, (m, "shim must forward **kw")
+        assert set(kw) - {None} == {
+            "run_transformer_block",
+            "rms_norm",
+            "run_lm_head",
+            "eps",
+        }, (m, sorted(str(k) for k in kw))
+        assert getattr(kw["run_transformer_block"], "id", None) == block, (m, block)
+        assert getattr(kw["eps"], "id", None) == "EPS", m
+        assert getattr(kw["run_lm_head"], "id", None) == "_run_lm_head", m
+
+
 if __name__ == "__main__":
     sys.exit(_main())
