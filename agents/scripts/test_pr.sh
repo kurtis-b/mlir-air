@@ -118,6 +118,9 @@ check "no required checks + completed successful runs -> PASS" "PASS" "$(cidec "
 check "no required checks + a FAILED Ryzen run: not required, never counts -> PASS (run level too)" "PASS" "$(cidec "" "$ALLPASS" "[]" '[{"status":"completed","conclusion":"failure","workflowName":"Build and Test with AIE tools on Ryzen AI"}]')"
 check "ruleset lookup unreadable after retries -> PENDING, never PASS" "PENDING" "$(FAKE_RULES_FAIL=1 cidec "" "$ALLPASS" "[]" "[]")"
 check "workflow-run lookup unreadable after retries -> PENDING, never PASS" "PENDING" "$(FAKE_RUNS_FAIL=1 cidec "" "$ALLPASS" "[]" "[]")"
+# The run list can also come back readable but not a list (an API error object, an empty body on
+# a zero exit). That is still "not yet known", never "nothing is running" -- untested until now.
+check "workflow-run list readable but not a JSON array -> PENDING, never PASS" "PENDING" "$(cidec "" "$ALLPASS" "[]" '{"unexpected":"shape"}')"
 check "malformed ruleset response -> PENDING" "PENDING" "$(cidec "" "$ALLPASS" "not json" "[]")"
 check "ruleset names checks: only they decide (a pending non-required one is ignored)" "PASS" "$(cidec '[{"name":"size","bucket":"pass"}]' "${ALLPASS%]},{\"name\":\"other\",\"bucket\":\"pending\"}]" '["size"]')"
 check "ruleset names checks: a required failure -> FAIL" "FAIL" "$(cidec '[{"name":"size","bucket":"fail"}]' "$ALLPASS" '["size"]')"
