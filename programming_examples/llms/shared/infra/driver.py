@@ -3,30 +3,35 @@
 
 """Shared CLI driver steps for the bf16 inference examples.
 
-`build_session` was one implementation copied into six `<model>_inference.py`
-files (346 lines; the only textual difference was black's wrapping of one call).
-It is kept here once, with the per-model handles passed in — the injection
-contract recorded for goal 6c: the config and Session classes, the model-id
-map, the two compile callables, and this model's weights/rope/runtime helpers.
+Each function here was one implementation copied into every model's
+`<model>_inference.py`; it lives here once, with the genuinely per-model handles
+passed in — goal 6c's injection contract.
+
+    build_session      6 copies, 346 lines   config/Session classes, model-id map,
+                                             two compile callables, weights/rope/
+                                             runtime helpers
+    run_once           7 copies, 264 lines   this model's `generate`
+    repl_loop          7 copies, 314 lines   this model's `generate`
+    tokenize_prompt    7 copies,  72 lines   nothing (fully generic)
 
 Gating a change here — the recipe, because the obvious gate does not work.
-`build_session` is reached from each model's CLI `main`, NOT from
-`verify_adapter.py`, so `make verify` passes whatever this function does. The
-signal is `make run N_TOKENS=16`, whose greedy (argmax) decode is deterministic:
-capture its output before and after with timings and throughput stripped, and
-the generated token ids must be unchanged.
+None of this is reached from `verify_adapter.py`; it hangs off each model's CLI
+`main`, so `make verify` passes whatever these functions do. The signal is
+`make run N_TOKENS=16`, whose greedy (argmax) decode is deterministic: capture
+its output before and after with timings and throughput stripped, and the
+generated token ids must be unchanged. Baseline twice before trusting it.
 
-Measured on 2026-09-04, when the six copies were consolidated into this file:
+Measured on 2026-09-04, per consolidation, all under Turbo, all rc=0:
 
-    qwen3_0_6b   before == after   first token 25   rc=0
-    qwen3_1_7b   before == after                    rc=0
-    qwen25_0_5b  before == after                    rc=0
+    build_session  (devq 913/914 baseline, 915 after)   3/3 models identical
+    REPL trio      (devq 916 baseline,     917 after)   3/3 models identical
 
-captured under Turbo, baseline taken TWICE first (identical, so the comparison
-is a real signal rather than a coincidence) and once after the change. The other
-three callers — qwen3_4b, qwen25_3b, qwen25_1_5b — cannot `make run` on the
-development machine (empty kernel-cache manifests, pre-existing and unrelated);
-their guard is the wiring test in `test_driver.py`, not a device run.
+The three models are qwen3_0_6b, qwen3_1_7b and qwen25_0_5b — the only ones that
+`make run` on the development machine; qwen3_4b, qwen25_3b, qwen25_1_5b and
+llama32_3b have empty kernel-cache manifests (pre-existing, unrelated), so their
+guard is the wiring test in `test_driver.py`, not a device run. Note also that
+`make run` drives `run_once` and `tokenize_prompt` but NOT `repl_loop`, which is
+interactive: the REPL's guard is its host tests, which script stdin.
 """
 
 import sys
