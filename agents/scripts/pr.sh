@@ -41,7 +41,16 @@ cd "${ROOT_DIR}"
 die() { echo "pr.sh: $*" >&2; exit 2; }
 note() { echo "pr.sh: $*" >&2; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 not found on PATH"; }
-need gh; need git; need codex; need jq; need python3
+need gh; need git; need codex; need jq
+
+# A failed `gh` call prints nothing, and jq cannot parse an empty string. Every CI-state block
+# used to carry its own `try: json.load(...) except: []`; this is that fallback, once. A payload
+# that is not a JSON array (empty, malformed, or an object) becomes $2, default the empty list.
+as_array() { # as_array <json> [fallback-json]
+  local out
+  out="$(printf '%s' "$1" | jq -c 'select(type == "array")' 2>/dev/null)"
+  if [ -n "$out" ]; then printf '%s' "$out"; else printf '%s' "${2:-[]}"; fi
+}
 
 # owner/repo behind `origin`, for https, ssh and scp-style URLs. Exported as GH_REPO so gh never
 # resolves a PR number against another remote (a bare `gh pr view 3` here once meant Xilinx#3).
@@ -357,20 +366,20 @@ ci_checks_json() { # ci_checks_json <N> <sha>
   if ! required="$(gh_json api "repos/${GH_REPO}/rules/branches/${BASE}" --jq '[.[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context]' 2>/dev/null)"; then
     echo '[{"name":"ruleset lookup","bucket":"pending","state":"UNREADABLE"}]'; return
   fi
-  if ! printf '%s' "$required" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+  # `jq empty` is NOT the check here: it exits 0 on an empty body, where python's json.load
+  # raised. A ruleset call that exits 0 with nothing -- or with an object -- must stay
+  # fail-closed, so require an array.
+  if ! printf '%s' "$required" | jq -e 'type == "array"' >/dev/null 2>&1; then
     echo '[{"name":"ruleset lookup","bucket":"pending","state":"MALFORMED"}]'; return
   fi
   if [ "$required" != '[]' ]; then
     set +e
     json="$(gh pr checks "$n" --required --json name,state,bucket 2>/dev/null)"
     set -e
-    printf '%s' "$json" | REQUIRED="$required" python3 -c '
-import json, os, sys
-try: checks = json.load(sys.stdin)
-except Exception: checks = []
-names = {c.get("name") for c in checks}
-missing = [r for r in json.loads(os.environ["REQUIRED"]) if r not in names]
-print(json.dumps(checks + [{"name": m, "bucket": "pending", "state": "UNREPORTED"} for m in missing]))'
+    jq -cn --argjson checks "$(as_array "$json")" --argjson required "$required" '
+      ($checks | map(.name)) as $names
+      | $checks + [$required[] | . as $r | select($names | index($r) | not)
+                   | {name: $r, bucket: "pending", state: "UNREPORTED"}]'
     return
   fi
   set +e
@@ -380,33 +389,30 @@ print(json.dumps(checks + [{"name": m, "bucket": "pending", "state": "UNREPORTED
   if ! runs="$(gh_json run list --commit "$sha" --json status,conclusion,workflowName 2>/dev/null)"; then
     echo '[{"name":"workflow-run lookup","bucket":"pending","state":"UNREADABLE"}]'; return
   fi
-  printf '%s' "$json" | CI_OPTIONAL_RE="$CI_OPTIONAL_RE" RUNS="$runs" python3 -c '
-import json, os, re, sys
-try: checks = json.load(sys.stdin)
-except Exception: checks = []
-opt = re.compile(os.environ["CI_OPTIONAL_RE"])
-checks = [c for c in checks if not opt.search(c.get("name", ""))]
-try: runs = json.loads(os.environ["RUNS"])
-except Exception: runs = [{"workflowName": "workflow-run lookup", "status": "MALFORMED"}]
-BAD = {"failure", "cancelled", "timed_out", "startup_failure", "action_required", "stale"}
-for r in runs:
-    w = r.get("workflowName", "")
-    if opt.search(w): continue
-    if r.get("status") != "completed": checks.append({"name": "run:" + w, "bucket": "pending", "state": str(r.get("status"))})
-    elif r.get("conclusion") in BAD: checks.append({"name": "run:" + w, "bucket": "fail", "state": str(r.get("conclusion"))})
-print(json.dumps(checks))'
+  # An unreadable run list is "not yet known", exactly as before: it becomes one pending row.
+  jq -cn --argjson checks "$(as_array "$json")" \
+    --argjson runs "$(as_array "$runs" '[{"workflowName":"workflow-run lookup","status":"MALFORMED"}]')" \
+    --arg re "$CI_OPTIONAL_RE" '
+      ["failure","cancelled","timed_out","startup_failure","action_required","stale"] as $bad
+      | ($checks | map(select((.name // "") | test($re) | not)))
+      + [$runs[]
+         | select((.workflowName // "") | test($re) | not)
+         | (.workflowName // "") as $w
+         | (.conclusion // "") as $c
+         | if .status != "completed"
+           then {name: ("run:" + $w), bucket: "pending", state: (.status | tostring)}
+           elif ($bad | index($c))
+           then {name: ("run:" + $w), bucket: "fail", state: $c}
+           else empty end]'
 }
 
 # One poll's verdict: NONE (nothing reported yet), FAIL, PENDING or PASS.
 ci_decide() { # ci_decide <checks-json>
-  printf '%s' "$1" | python3 -c '
-import json, sys
-try: checks = json.load(sys.stdin)
-except Exception: checks = []
-if not checks: print("NONE")
-elif any(c.get("bucket") in ("fail", "cancel") for c in checks): print("FAIL")
-elif any(c.get("bucket") == "pending" for c in checks): print("PENDING")
-else: print("PASS")'
+  printf '%s' "$(as_array "$1")" | jq -r '
+    if length == 0 then "NONE"
+    elif any(.[]; .bucket == "fail" or .bucket == "cancel") then "FAIL"
+    elif any(.[]; .bucket == "pending") then "PENDING"
+    else "PASS" end'
 }
 
 ci_state() { # ci_state <N> <sha>
