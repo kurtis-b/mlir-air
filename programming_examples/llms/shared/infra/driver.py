@@ -9,10 +9,24 @@ It is kept here once, with the per-model handles passed in — the injection
 contract recorded for goal 6c: the config and Session classes, the model-id
 map, the two compile callables, and this model's weights/rope/runtime helpers.
 
-Note for anyone gating a change here: `build_session` is reached from the
-inference CLI's `main`, NOT from `verify_adapter.py`, so `make verify` passes
-regardless of what this function does. The signal is `make run`, whose greedy
-(argmax) decode is deterministic — see `agents/.state/6c-gate/`.
+Gating a change here — the recipe, because the obvious gate does not work.
+`build_session` is reached from each model's CLI `main`, NOT from
+`verify_adapter.py`, so `make verify` passes whatever this function does. The
+signal is `make run N_TOKENS=16`, whose greedy (argmax) decode is deterministic:
+capture its output before and after with timings and throughput stripped, and
+the generated token ids must be unchanged.
+
+Measured on 2026-09-04, when the six copies were consolidated into this file:
+
+    qwen3_0_6b   before == after   first token 25   rc=0
+    qwen3_1_7b   before == after                    rc=0
+    qwen25_0_5b  before == after                    rc=0
+
+captured under Turbo, baseline taken TWICE first (identical, so the comparison
+is a real signal rather than a coincidence) and once after the change. The other
+three callers — qwen3_4b, qwen25_3b, qwen25_1_5b — cannot `make run` on the
+development machine (empty kernel-cache manifests, pre-existing and unrelated);
+their guard is the wiring test in `test_driver.py`, not a device run.
 """
 
 import sys
