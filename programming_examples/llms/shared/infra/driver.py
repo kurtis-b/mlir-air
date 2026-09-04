@@ -30,6 +30,7 @@ their guard is the wiring test in `test_driver.py`, not a device run.
 """
 
 import sys
+import time
 
 from ml_dtypes import bfloat16
 
@@ -111,3 +112,91 @@ def build_session(
         rope_lut_bf16=rope_lut_bf16,
         model_variant=args.model,
     )
+
+
+def tokenize_prompt(session, prompt_text):
+    """Encode a prompt, applying the chat template for the instruct variant.
+
+    Carried verbatim from the seven copies. llama32_3b's copy differed only in
+    having no type annotations; the body was identical.
+    """
+    if session.model_variant == "instruct":
+        messages = [{"role": "user", "content": prompt_text}]
+        chat_text = session.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        return session.tokenizer.encode(chat_text)
+    return session.tokenizer.encode(prompt_text)
+
+
+def run_once(
+    session,
+    prompt_text,
+    *,
+    generate,
+    n_tokens,
+    profile=False,
+    cpu_attn=True,
+    on_token=None,
+):
+    """One prompt through prefill+decode. `generate` is the model's own."""
+    ttft_start = time.perf_counter()
+    with session.prefill_cache.profiler.time_cpu("tokenize"):
+        tokens = tokenize_prompt(session, prompt_text)
+    prompt_len_actual = len(tokens)
+    with session.prefill_cache.profiler.time_cpu("eos_pad"):
+        if len(tokens) < session.seq_len:
+            tokens = tokens + [session.tokenizer.eos_token_id] * (
+                session.seq_len - len(tokens)
+            )
+    generated = generate(
+        tokens,
+        session.weights,
+        session.config,
+        session.prefill_cache,
+        session.decode_cache,
+        session.rope_lut_bf16,
+        tokenizer=session.tokenizer,
+        n_tokens=n_tokens,
+        profile=profile,
+        cpu_attn=cpu_attn,
+        on_token=on_token,
+        ttft_start=ttft_start,
+    )
+    return generated, prompt_len_actual
+
+
+def repl_loop(session, args, *, generate):
+    """Interactive prompt loop. Ctrl-D, Ctrl-C or /quit leaves it."""
+    print("\nInteractive mode — Ctrl-D or /quit to exit.\n")
+
+    def _cb(_tid, delta):
+        sys.stdout.write(delta)
+        sys.stdout.flush()
+
+    while True:
+        try:
+            prompt = input("Prompt> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not prompt:
+            continue
+        if prompt in ("/quit", "/exit"):
+            return
+        sys.stdout.write("\nResponse: ")
+        sys.stdout.flush()
+        try:
+            run_once(
+                session,
+                prompt,
+                generate=generate,
+                n_tokens=args.n_tokens,
+                profile=False,
+                cpu_attn=args.cpu_attn,
+                on_token=_cb,
+            )
+        except KeyboardInterrupt:
+            print("\n[interrupted]")
+            continue
+        print("\n")

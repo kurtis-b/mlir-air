@@ -235,5 +235,163 @@ def _main():
     return 1 if failed else 0
 
 
+# --- the REPL trio (slice 2) ----------------------------------------------
+# `make run` reaches run_once and tokenize_prompt, so those have a device gate.
+# `repl_loop` is interactive and no device gate can reach it: these are its only
+# guard, which is why they cover /quit, EOF, blank input and Ctrl-C separately.
+
+REPL_MODELS = [
+    "llama32_3b",
+    "qwen25_0_5b",
+    "qwen25_1_5b",
+    "qwen25_3b",
+    "qwen3_0_6b",
+    "qwen3_1_7b",
+    "qwen3_4b",
+]
+
+
+class _Prof:
+    def time_cpu(self, _name):
+        import contextlib
+
+        return contextlib.nullcontext()
+
+
+def _session(variant="base", seq_len=8, eos=99):
+    tok = SimpleNamespace(
+        encode=lambda t: [1, 2, 3],
+        apply_chat_template=lambda m, tokenize, add_generation_prompt: "CHAT:"
+        + m[0]["content"],
+        eos_token_id=eos,
+    )
+    return SimpleNamespace(
+        model_variant=variant,
+        tokenizer=tok,
+        seq_len=seq_len,
+        weights="W",
+        config="C",
+        prefill_cache=SimpleNamespace(profiler=_Prof()),
+        decode_cache="DC",
+        rope_lut_bf16="ROPE",
+    )
+
+
+def test_tokenize_prompt_applies_the_chat_template_only_for_instruct():
+    base = _session()
+    assert driver.tokenize_prompt(base, "hi") == [1, 2, 3]
+    chat = _session(variant="instruct")
+    seen = {}
+
+    def _encode(text):
+        seen["text"] = text
+        return [7]
+
+    chat.tokenizer.encode = _encode
+    assert driver.tokenize_prompt(chat, "hi") == [7]
+    assert seen["text"] == "CHAT:hi", seen
+
+
+def test_run_once_pads_to_seq_len_and_passes_the_models_generate():
+    got = {}
+
+    def fake_generate(tokens, w, c, pc, dc, rope, **kw):
+        got["tokens"] = tokens
+        got["kw"] = kw
+        return ["tok"]
+
+    s = _session(seq_len=6, eos=99)
+    out, plen = driver.run_once(s, "hi", generate=fake_generate, n_tokens=4)
+    assert out == ["tok"] and plen == 3, (out, plen)
+    # padded to seq_len with eos, and the UNPADDED length is what is reported
+    assert got["tokens"] == [1, 2, 3, 99, 99, 99], got["tokens"]
+    assert got["kw"]["n_tokens"] == 4 and got["kw"]["ttft_start"] > 0
+
+
+def test_run_once_does_not_pad_a_prompt_already_at_seq_len():
+    got = {}
+    s = _session(seq_len=3)
+    driver.run_once(
+        s,
+        "hi",
+        generate=lambda t, *a, **k: got.setdefault("tokens", t),
+        n_tokens=1,
+    )
+    assert got["tokens"] == [1, 2, 3], got["tokens"]
+
+
+def _repl(inputs, generate):
+    """Drive repl_loop with a scripted stdin."""
+    import builtins
+
+    it = iter(inputs)
+
+    def fake_input(_prompt=""):
+        try:
+            return next(it)
+        except StopIteration:
+            raise EOFError
+
+    real = builtins.input
+    builtins.input = fake_input
+    try:
+        driver.repl_loop(
+            _session(), SimpleNamespace(n_tokens=4, cpu_attn=False), generate=generate
+        )
+    finally:
+        builtins.input = real
+
+
+def test_repl_loop_runs_a_prompt_then_leaves_on_quit():
+    calls = []
+    _repl(["hello", "/quit", "never reached"], lambda *a, **k: calls.append(k))
+    assert len(calls) == 1, calls
+    assert calls[0]["on_token"] is not None and calls[0]["n_tokens"] == 4
+
+
+def test_repl_loop_skips_blank_input_and_leaves_on_eof():
+    calls = []
+    _repl(["", "   "], lambda *a, **k: calls.append(k))  # then EOF
+    assert calls == [], calls
+
+
+def test_repl_loop_survives_ctrl_c_during_generation():
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(k)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        return []
+
+    try:
+        _repl(["one", "two", "/quit"], boom)
+    except KeyboardInterrupt:
+        # Caught here on purpose: if repl_loop stops swallowing this, the escape
+        # would otherwise kill the whole harness with rc=130 and report no test.
+        raise AssertionError("Ctrl-C during generation escaped repl_loop")
+    assert len(calls) == 2, "an interrupted generation must not end the session"
+
+
+def test_each_shim_binds_its_own_generate():
+    """`generate` is model-local; a shim must pass its own, not import another's."""
+    for m in REPL_MODELS:
+        tree = ast.parse((_LLMS / m / f"{m}_inference.py").read_text())
+        for name in ("run_once", "repl_loop"):
+            fn = [
+                n
+                for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == name
+            ]
+            assert len(fn) == 1, (m, name)
+            call = [n for n in ast.walk(fn[0]) if isinstance(n, ast.Call)]
+            assert call, (m, name)
+            kw = {k.arg: getattr(k.value, "id", None) for k in call[0].keywords}
+            assert kw.get("generate") == "generate", (m, name, kw)
+        # and `generate` must be defined in this file, not imported from elsewhere
+        local = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+        assert "generate" in local, m
+
+
 if __name__ == "__main__":
     sys.exit(_main())
