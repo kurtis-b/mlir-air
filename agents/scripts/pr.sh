@@ -366,7 +366,10 @@ ci_checks_json() { # ci_checks_json <N> <sha>
   if ! required="$(gh_json api "repos/${GH_REPO}/rules/branches/${BASE}" --jq '[.[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context]' 2>/dev/null)"; then
     echo '[{"name":"ruleset lookup","bucket":"pending","state":"UNREADABLE"}]'; return
   fi
-  if ! printf '%s' "$required" | jq empty 2>/dev/null; then
+  # `jq empty` is NOT the check here: it exits 0 on an empty body, where python's json.load
+  # raised. A ruleset call that exits 0 with nothing -- or with an object -- must stay
+  # fail-closed, so require an array.
+  if ! printf '%s' "$required" | jq -e 'type == "array"' >/dev/null 2>&1; then
     echo '[{"name":"ruleset lookup","bucket":"pending","state":"MALFORMED"}]'; return
   fi
   if [ "$required" != '[]' ]; then
