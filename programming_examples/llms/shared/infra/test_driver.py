@@ -221,7 +221,7 @@ def test_each_shim_wires_the_right_handle_from_the_right_module():
 
 
 def _main():
-    tests = [(f.__name__, f) for n, f in sorted(globals().items()) if n.startswith("test_") for f in [globals()[n]]]
+    tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     failed = []
     for name, fn in tests:
         try:
