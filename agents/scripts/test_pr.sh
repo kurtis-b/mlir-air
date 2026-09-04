@@ -21,7 +21,7 @@ cat <<'JSON'
 ]}
 JSON
 elif [[ "$1 $2" == "api user" ]]; then echo gatebot
-elif [[ "$1 $2" == api\ repos/*/rules/branches/* ]]; then [ -z "${FAKE_RULES_FAIL:-}" ] || exit 1; printf '%s' "${FAKE_REQUIRED_SET:-[]}"
+elif [[ "$1 $2" == api\ repos/*/rules/branches/* ]]; then [ -z "${FAKE_RULES_FAIL:-}" ] || exit 1; [ -z "${FAKE_RULES_BODY:-}" ] || { printf '%s' "${FAKE_RULES_BODY#none}"; exit 0; }; printf '%s' "${FAKE_REQUIRED_SET:-[]}"
 elif [[ "$1 $2" == "run list" ]]; then [ -z "${FAKE_RUNS_FAIL:-}" ] || exit 1; printf '%s' "${FAKE_RUNS:-[]}"
 elif [[ "$1 $2" == "pr checks" ]]; then
   if [[ " $* " == *" --required "* ]]; then
@@ -117,7 +117,14 @@ check "no required checks + a completed cancelled run -> FAIL" "FAIL" "$(cidec "
 check "no required checks + completed successful runs -> PASS" "PASS" "$(cidec "" "$ALLPASS" "[]" '[{"status":"completed","conclusion":"success","workflowName":"Build and Test"}]')"
 check "no required checks + a FAILED Ryzen run: not required, never counts -> PASS (run level too)" "PASS" "$(cidec "" "$ALLPASS" "[]" '[{"status":"completed","conclusion":"failure","workflowName":"Build and Test with AIE tools on Ryzen AI"}]')"
 check "ruleset lookup unreadable after retries -> PENDING, never PASS" "PENDING" "$(FAKE_RULES_FAIL=1 cidec "" "$ALLPASS" "[]" "[]")"
+# The ruleset call can also exit 0 and write nothing, or write something that is not a list of
+# contexts. Both must stay fail-closed: "not yet known", never "nothing is required".
+check "ruleset lookup exits 0 with an EMPTY body -> PENDING, never PASS" "PENDING" "$(FAKE_RULES_BODY=none cidec "" "$ALLPASS" "[]" "[]")"
+check "ruleset lookup exits 0 with a non-array body -> PENDING, never PASS" "PENDING" "$(FAKE_RULES_BODY='{"unexpected":"shape"}' cidec "" "$ALLPASS" "[]" "[]")"
 check "workflow-run lookup unreadable after retries -> PENDING, never PASS" "PENDING" "$(FAKE_RUNS_FAIL=1 cidec "" "$ALLPASS" "[]" "[]")"
+# The run list can also come back readable but not a list (an API error object, an empty body on
+# a zero exit). That is still "not yet known", never "nothing is running" -- untested until now.
+check "workflow-run list readable but not a JSON array -> PENDING, never PASS" "PENDING" "$(cidec "" "$ALLPASS" "[]" '{"unexpected":"shape"}')"
 check "malformed ruleset response -> PENDING" "PENDING" "$(cidec "" "$ALLPASS" "not json" "[]")"
 check "ruleset names checks: only they decide (a pending non-required one is ignored)" "PASS" "$(cidec '[{"name":"size","bucket":"pass"}]' "${ALLPASS%]},{\"name\":\"other\",\"bucket\":\"pending\"}]" '["size"]')"
 check "ruleset names checks: a required failure -> FAIL" "FAIL" "$(cidec '[{"name":"size","bucket":"fail"}]' "$ALLPASS" '["size"]')"
