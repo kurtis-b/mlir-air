@@ -13,6 +13,15 @@ passed in — goal 6c's injection contract.
     run_once           7 copies, 264 lines   this model's `generate`
     repl_loop          7 copies, 314 lines   this model's `generate`
     tokenize_prompt    7 copies,  72 lines   nothing (fully generic)
+    generate           6 copies, 570 lines   this model's run_npu_prefill and
+                                             run_npu_decode_step, plus `label`
+    StreamState        6 copies,  18 lines   nothing
+    delta_text         6 copies,  30 lines   nothing
+
+`generate`'s six copies hashed as two bodies, but the two differ by exactly one
+line — the banner string — so `label` is a parameter and the rest is shared.
+`run_npu_prefill` (3 distinct implementations across the six) and
+`run_npu_decode_step` (2) are genuinely per-model and stay injected.
 
 Gating a change here — the recipe, because the obvious gate does not work.
 None of this is reached from `verify_adapter.py`; it hangs off each model's CLI
@@ -25,6 +34,13 @@ Measured on 2026-09-04, per consolidation, all under Turbo, all rc=0:
 
     build_session  (devq 913/914 baseline, 915 after)   3/3 models identical
     REPL trio      (devq 916 baseline,     917 after)   3/3 models identical
+    generate path  (devq 918 baseline,     919 after)   3/3 models identical
+
+Each baseline reproduced its predecessor byte-for-byte (913 == 914 == 916 == 918),
+so an unchanged result is a real signal and not a fixture that never varies. The
+`generate` banner is printed output, so that run also checks the `label` wiring
+directly: 919 shows `Qwen3 Inference:` for the qwen3 models and `Qwen2.5
+Inference:` for qwen25_0_5b.
 
 The three models are qwen3_0_6b, qwen3_1_7b and qwen25_0_5b — the only ones that
 `make run` on the development machine; qwen3_4b, qwen25_3b, qwen25_1_5b and
@@ -205,3 +221,125 @@ def repl_loop(session, args, *, generate):
             print("\n[interrupted]")
             continue
         print("\n")
+
+
+class StreamState:
+    """Cursor into the decoded text, so streaming emits deltas not repeats."""
+
+    def __init__(self) -> None:
+        self.printed_len: int = 0
+
+
+def delta_text(tokenizer, ids, state):
+    """The text `ids` adds beyond what has already been streamed."""
+    decoded = tokenizer.decode(ids, skip_special_tokens=True)
+    delta = decoded[state.printed_len :]
+    state.printed_len = len(decoded)
+    return delta
+
+
+def generate(
+    prompt_tokens,
+    weights,
+    config,
+    prefill_cache,
+    decode_cache,
+    rope_lut_bf16,
+    tokenizer,
+    n_tokens=10,
+    profile=False,
+    cpu_attn=True,
+    on_token=None,
+    ttft_start=None,
+    *,
+    run_npu_prefill,
+    run_npu_decode_step,
+    label,
+):
+    """NPU prefill then greedy decode. `label` only names the model in the banner.
+
+    `run_npu_prefill` and `run_npu_decode_step` are this model's own — they are
+    genuinely per-model (3 and 2 distinct implementations across the six), which
+    is why they are injected rather than shared.
+    """
+    seq_len = len(prompt_tokens)
+    max_seq = seq_len + n_tokens
+    streaming = on_token is not None
+    if ttft_start is None:
+        ttft_start = time.perf_counter()
+
+    if not streaming:
+        print(f"\n{'='*60}")
+        print(f"{label} Inference: prompt_len={seq_len}, n_tokens={n_tokens}")
+        print(f"{'='*60}\n")
+
+    prefill_token, _logits, k_cache, v_cache, prompt_len = run_npu_prefill(
+        prompt_tokens,
+        weights,
+        config,
+        prefill_cache,
+        decode_cache,
+        rope_lut_bf16,
+        max_seq,
+        tokenizer=tokenizer,
+        cpu_attn=cpu_attn,
+        profile=profile,
+        quiet=True,
+    )
+
+    ttft = time.perf_counter() - ttft_start
+    if not streaming:
+        print(f"Time to first token (TTFT): {ttft:.2f}s. First token: {prefill_token}")
+
+    generated_tokens = [prefill_token]
+    current_pos = prompt_len
+    x_decode = weights.embed_table[prefill_token].astype(bfloat16)
+
+    stream_state = StreamState() if streaming else None
+    if streaming:
+        on_token(prefill_token, delta_text(tokenizer, generated_tokens, stream_state))
+
+    if not streaming:
+        print(f"\nDecoding {n_tokens} tokens...")
+    t_dec = time.time()
+
+    eos_ids = {tokenizer.eos_token_id}
+    eot = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if isinstance(eot, int) and eot >= 0:
+        eos_ids.add(eot)
+
+    for _ in range(n_tokens):
+        next_token, _ = run_npu_decode_step(
+            x_decode,
+            weights,
+            config,
+            decode_cache,
+            rope_lut_bf16,
+            k_cache,
+            v_cache,
+            current_pos,
+        )
+        generated_tokens.append(next_token)
+        current_pos += 1
+        with decode_cache.profiler.time_cpu("embed_lookup"):
+            x_decode = weights.embed_table[next_token].astype(bfloat16)
+        if streaming:
+            on_token(next_token, delta_text(tokenizer, generated_tokens, stream_state))
+        if next_token in eos_ids:
+            break
+
+    t_decode = time.time() - t_dec
+    n_gen = len(generated_tokens) - 1
+    if not streaming and n_gen > 0:
+        print(
+            f"\nGenerated {n_gen} tokens in {t_decode:.2f}s ({n_gen / t_decode:.2f} tok/s)"
+        )
+
+    if prefill_cache.profiler.enabled:
+        print(f"\n{'='*60}\nPREFILL detail")
+        prefill_cache.profiler.report()
+    if decode_cache.profiler.enabled:
+        print(f"\n{'='*60}\nDECODE detail")
+        decode_cache.profiler.report()
+
+    return generated_tokens

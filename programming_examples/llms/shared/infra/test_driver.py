@@ -393,5 +393,138 @@ def test_each_shim_binds_its_own_generate():
         assert "generate" in local, m
 
 
+# --- the generate path (slice 3) ------------------------------------------
+# `make run` DOES reach this one, and its banner is printed output, so the
+# device comparison checks the label wiring directly. These cover the parts a
+# 16-token run does not exercise: EOS stop, streaming deltas, and the per-model
+# handles.
+
+GEN_MODELS = {
+    "qwen25_0_5b": "Qwen2.5",
+    "qwen25_1_5b": "Qwen2.5",
+    "qwen25_3b": "Qwen2.5",
+    "qwen3_0_6b": "Qwen3",
+    "qwen3_1_7b": "Qwen3",
+    "qwen3_4b": "Qwen3",
+}
+
+
+def _gen_env(decode_tokens, eos=99, eot=-1):
+    """Fakes for generate(): prefill returns token 5, decode replays a script."""
+    seen = {"decode_positions": []}
+
+    def prefill(tokens, w, c, pc, dc, rope, max_seq, **kw):
+        seen["prefill"] = dict(n=len(tokens), max_seq=max_seq, kw=kw)
+        return 5, None, "K", "V", 3
+
+    it = iter(decode_tokens)
+
+    def step(x, w, c, dc, rope, k, v, pos):
+        seen["decode_positions"].append(pos)
+        return next(it), None
+
+    tok = SimpleNamespace(
+        eos_token_id=eos,
+        convert_tokens_to_ids=lambda s: eot,
+        decode=lambda ids, skip_special_tokens=True: "".join(f"<{i}>" for i in ids),
+    )
+    weights = SimpleNamespace(embed_table={i: np.zeros(2) for i in range(200)})
+    caches = SimpleNamespace(profiler=_Prof())
+    caches.profiler.enabled = False
+    return seen, tok, weights, caches, prefill, step
+
+
+def _run_generate(decode_tokens, *, label="Qwen3", on_token=None, n_tokens=3, eos=99):
+    seen, tok, weights, caches, prefill, step = _gen_env(decode_tokens, eos=eos)
+    out = driver.generate(
+        [1, 2, 3],
+        weights,
+        "CFG",
+        caches,
+        caches,
+        "ROPE",
+        tok,
+        n_tokens=n_tokens,
+        on_token=on_token,
+        run_npu_prefill=prefill,
+        run_npu_decode_step=step,
+        label=label,
+    )
+    return out, seen
+
+
+def test_generate_prints_the_models_label_in_the_banner(capsys=None):
+    import io
+    import contextlib
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _run_generate([10, 11, 12], label="Qwen2.5")
+    text = buf.getvalue()
+    assert "Qwen2.5 Inference: prompt_len=3, n_tokens=3" in text, text[:200]
+    assert "Qwen3 Inference" not in text
+
+
+def test_generate_returns_prefill_token_then_the_decoded_ones():
+    out, seen = _run_generate([10, 11, 12])
+    assert out == [5, 10, 11, 12], out
+    assert seen["prefill"]["max_seq"] == 6, seen["prefill"]
+    # decode walks forward from the prompt length the prefill reported
+    assert seen["decode_positions"] == [3, 4, 5], seen["decode_positions"]
+
+
+def test_generate_stops_at_eos_instead_of_running_the_full_budget():
+    out, seen = _run_generate([10, 99, 12], n_tokens=3, eos=99)
+    assert out == [5, 10, 99], out
+    assert len(seen["decode_positions"]) == 2, seen["decode_positions"]
+
+
+def test_streaming_emits_deltas_not_the_whole_string_each_time():
+    deltas = []
+    out, _ = _run_generate([10, 11], n_tokens=2, on_token=lambda t, d: deltas.append(d))
+    # one callback for the prefill token, then one per decoded token
+    assert deltas == ["<5>", "<10>", "<11>"], deltas
+    assert out == [5, 10, 11]
+
+
+def test_delta_text_advances_the_cursor():
+    state = driver.StreamState()
+    tok = SimpleNamespace(
+        decode=lambda ids, skip_special_tokens=True: "abc"[: len(ids)]
+    )
+    assert driver.delta_text(tok, [1], state) == "a"
+    assert driver.delta_text(tok, [1, 2], state) == "b"
+    assert state.printed_len == 2
+
+
+def test_each_shim_binds_its_own_npu_steps_and_the_right_label():
+    """The label is printed output, so a wrong one is a visible regression."""
+    for m, label in GEN_MODELS.items():
+        tree = ast.parse((_LLMS / m / f"{m}_inference.py").read_text())
+        fn = [
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "generate"
+        ]
+        assert len(fn) == 1, m
+        call = [n for n in ast.walk(fn[0]) if isinstance(n, ast.Call)][0]
+        kw = {k.arg: k.value for k in call.keywords}
+        # `arg=None` is the `**kw` forward; without it the shim would silently
+        # drop the caller's n_tokens/on_token/ttft_start.
+        assert None in kw, (m, "shim must forward **kw")
+        assert set(kw) - {None} == {
+            "run_npu_prefill",
+            "run_npu_decode_step",
+            "label",
+        }, (m, sorted(str(k) for k in kw))
+        assert getattr(kw["run_npu_prefill"], "id", None) == "run_npu_prefill", m
+        assert (
+            getattr(kw["run_npu_decode_step"], "id", None) == "run_npu_decode_step"
+        ), m
+        assert getattr(kw["label"], "value", None) == label, (m, ast.dump(kw["label"]))
+        local = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+        assert {"run_npu_prefill", "run_npu_decode_step"} <= local, m
+
+
 if __name__ == "__main__":
     sys.exit(_main())
