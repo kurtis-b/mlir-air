@@ -14,6 +14,17 @@ HERD_...") that the JSON's `used_by` does not have -- 101 of 207 rows differ
 there, in both directions. So the numbers are checked and the prose is left
 alone: a row may say more than the JSON, but it may not say a different number.
 
+WHAT IS COVERED: the per-method sections, whose rows start with the shape
+(`| 2048x2048x2048 | ...`). Each row is bound to ITS SECTION's method, so a
+fused-cast row cannot be satisfied by the drain measurement of the same shape.
+
+WHAT IS NOT: the "Transformer-layer execution study" sweep tables. They use a
+different layout (`| seq | (MxKxN) | fused-cast | drain | direct | ...`, one row
+per seq with all three methods side by side) and carry their own byte-compare
+gate against the `pre-port-20260829` tag, described in that section. Extending
+to them is a separate change; this file states the limit rather than implying
+the whole document is covered.
+
     python kernel_registry/test_registry_tables.py
 """
 
@@ -28,6 +39,17 @@ _DETAILS = _HERE / "details"
 
 # `| 2048×2048×2048 | 64/512/32/128 | **6215** | 9.7e-3 | ... |`
 _ROW = re.compile(r"^\|\s*(\d+)×(\d+)×(\d+)\s*\|([^|]*)\|([^|]*)\|([^|]*)\|")
+_HERD = re.compile(r"\((?:herd\s*)?\*{0,2}(\d+)\s*[×x]\s*(\d+)\*{0,2}\)")
+_SECTION = re.compile(r"^###\s+(.*)$")
+
+# Which JSON `methods` key each markdown section's rows belong to. A section
+# whose heading matches nothing here contributes no rows -- see WHAT IS NOT.
+_SECTION_METHOD = (
+    ("--method fused-cast", "fused-cast"),
+    ("--method drain", "drain"),
+    ("low-precision", "direct"),
+    ("external", "external"),
+)
 
 
 def _clean(cell):
@@ -35,7 +57,12 @@ def _clean(cell):
     return cell.replace("**", "").replace("†", "").strip()
 
 
-_HERD = re.compile(r"\(herd\s*(\d+)\s*[×x]\s*(\d+)\)")
+def _section_method(heading):
+    low = heading.lower()
+    for needle, method in _SECTION_METHOD:
+        if needle in low:
+            return method
+    return None
 
 
 def _split_tile(cell):
@@ -43,7 +70,7 @@ def _split_tile(cell):
 
     A row carries the herd only when it overrides the file-level default, and
     the JSON records that same override per method -- so it is checked, not
-    stripped.
+    stripped, and its ABSENCE is checked too (see `_herd_matches`).
     """
     m = _HERD.search(cell)
     herd = [int(m.group(1)), int(m.group(2))] if m else None
@@ -51,34 +78,58 @@ def _split_tile(cell):
 
 
 def _md_rows(path):
-    """(M, K, N, tile, herd, gflops, mean_rel_L1) per data row."""
+    """(method, M, K, N, tile, herd, gflops, mean_rel_L1, raw_line) per row."""
     rows = []
+    method = None
     for line in path.read_text().splitlines():
+        head = _SECTION.match(line)
+        if head:
+            method = _section_method(head.group(1))
+            continue
+        if method is None:
+            continue
         m = _ROW.match(line)
         if not m:
             continue
-        M, K, N = int(m.group(1)), int(m.group(2)), int(m.group(3))
         tile, herd = _split_tile(_clean(m.group(4)))
-        rows.append((M, K, N, tile, herd, _clean(m.group(5)), _clean(m.group(6))))
+        rows.append(
+            (
+                method,
+                int(m.group(1)),
+                int(m.group(2)),
+                int(m.group(3)),
+                tile,
+                herd,
+                _clean(m.group(5)),
+                _clean(m.group(6)),
+                line,
+            )
+        )
     return rows
 
 
 def _json_methods(path):
-    """{(M, K, N): [(tile, gflops, mean_rel_L1), ...]} from the registry JSON."""
+    """{(method, M, K, N): (tile, gflops, mean_rel_L1, herd)} -- keyed BY METHOD.
+
+    Pooling every method under the shape would let a row match a sibling
+    method's numbers, which is how a fused-cast row could quietly carry drain's
+    throughput.
+    """
     doc = json.loads(path.read_text())
     out = {}
     for shape in doc["shapes"]:
-        key = (shape["M"], shape["K"], shape["N"])
-        for method in shape.get("methods", {}).values():
+        for name, method in shape.get("methods", {}).items():
             t = method.get("tile") or {}
             tile = "/".join(
                 str(t[k])
                 for k in ("tile_m", "tile_k_l2", "tile_k_l1", "tile_n")
                 if k in t
             )
-            herd = method.get("herd")
-            out.setdefault(key, []).append(
-                (tile, method.get("gflops"), method.get("mean_rel_L1"), herd)
+            out[(name, shape["M"], shape["K"], shape["N"])] = (
+                tile,
+                method.get("gflops"),
+                method.get("mean_rel_L1"),
+                method.get("herd"),
             )
     return out
 
@@ -93,26 +144,37 @@ def _gflops_matches(cell, value):
 def _rel_l1_matches(cell, value):
     """The tables render this column rounded: JSON 0.00998 is shown as `1.0e-2`.
 
-    So compare the RENDERED form, not the raw float -- that still catches a
-    changed measurement (0.00998 -> 0.0123 renders differently) without
-    demanding the markdown carry five significant figures.
+    Compare within half of the cell's last displayed digit rather than against
+    one rendering: 0.0135 is stored just BELOW 1.35e-2, so Python renders
+    `1.3e-02` while the table, rounded by hand, says `1.4e-2`. Both are correct
+    roundings; a changed measurement (0.0135 -> 0.0123) still falls outside.
     """
     if not cell or value is None:
         return True  # the column is not always populated; nothing to contradict
     try:
-        float(cell)
+        c = float(cell)
     except ValueError:
         return True  # prose in that column is not a number to disagree with
-    # Compare within half of the cell's last displayed digit, rather than against
-    # one rendering: 0.0135 is stored just BELOW 1.35e-2, so Python renders
-    # `1.3e-02` while the table, rounded by hand, says `1.4e-2`. Both are correct
-    # roundings; a changed measurement (0.0135 -> 0.0123) still falls outside.
     v = float(value)
     if v == 0:
-        return float(cell) == 0
-    exp = math.floor(math.log10(abs(v)))
-    half = 0.5 * 10 ** (exp - 1)
-    return abs(float(cell) - v) <= half * (1 + 1e-9)
+        return c == 0
+    half = 0.5 * 10 ** (math.floor(math.log10(abs(v))) - 1)
+    return abs(c - v) <= half * (1 + 1e-9)
+
+
+def _herd_matches(md_herd, json_herd, row_text):
+    """Absence is meaningful, with one documented exception.
+
+    An annotation in the tile cell must match the JSON exactly, and its absence
+    normally means "file-level herd" -- so deleting one fails. The exception is
+    real and in the data: a few rows state the override in the Status prose
+    instead (`64×12288×960` says "tile_m=16 herd_m=4" while the JSON records
+    [4, 4]). Those are accepted only when the row actually mentions a herd, so
+    a row with no mention at all still cannot hide an override.
+    """
+    if md_herd is not None or not json_herd:
+        return list(md_herd or []) == list(json_herd or [])
+    return "herd" in row_text.lower()
 
 
 def _pairs():
@@ -125,41 +187,48 @@ def _pairs():
     return pairs
 
 
-def test_every_markdown_row_matches_a_json_method():
+# Rows the per-method sections carry today, per file. Exact, not a floor: a
+# deleted row must fail, and `>=` would have let it through.
+_EXPECTED_ROWS = {"GEMM_bf16_in_bf16_out.md": 207, "GEMM_bf16_in_fp32_out.md": 7}
+
+
+def test_every_markdown_row_matches_its_own_methods_json_entry():
     """A row may say MORE than the JSON, but never a different number."""
-    checked = 0
     for md, js in _pairs():
-        methods = _json_methods(js)
-        for M, K, N, tile, herd, gflops, rel in _md_rows(md):
-            cands = methods.get((M, K, N))
-            assert cands, f"{md.name}: {M}×{K}×{N} has no shape in {js.name}"
-            hit = [
-                c
-                for c in cands
-                if c[0] == tile
-                and _gflops_matches(gflops, c[1])
-                and _rel_l1_matches(rel, c[2])
-                and (herd is None or list(c[3] or []) == herd)
-            ]
-            assert hit, (
-                f"{md.name}: row {M}×{K}×{N} tile={tile} herd={herd} "
-                f"gflops={gflops} mean_rel_L1={rel} matches no method in "
-                f"{js.name}: {cands}"
-            )
-            checked += 1
-    # non-vacuity: if the row regex ever stops matching, this fails rather than
-    # silently checking nothing.
-    assert checked >= 200, f"expected the tables' ~207 rows, parsed {checked}"
-    print(f"    ({checked} markdown rows checked against the JSON)")
+        entries = _json_methods(js)
+        for method, M, K, N, tile, herd, gflops, rel, raw in _md_rows(md):
+            key = (method, M, K, N)
+            got = entries.get(key)
+            assert got, f"{md.name}: {M}×{K}×{N} has no `{method}` method in {js.name}"
+            assert got[0] == tile, f"{md.name}: {key} tile {tile} != {got[0]}"
+            assert _gflops_matches(
+                gflops, got[1]
+            ), f"{md.name}: {key} gflops {gflops} != {got[1]}"
+            assert _rel_l1_matches(
+                rel, got[2]
+            ), f"{md.name}: {key} mean_rel_L1 {rel} != {got[2]}"
+            assert _herd_matches(
+                herd, got[3], raw
+            ), f"{md.name}: {key} herd {herd} != {got[3]}"
 
 
-def test_every_json_shape_is_reachable_by_its_key():
-    """Guards the other direction: a shape the tables cannot address is dead data."""
-    for _, js in _pairs():
-        methods = _json_methods(js)
-        assert methods, f"{js.name}: no shapes parsed"
-        for key, cands in methods.items():
-            assert all(len(c) == 4 for c in cands), (js.name, key)
+def test_no_table_row_has_gone_missing():
+    """The count is exact per file, so a deleted row fails here.
+
+    It also fails if the row regex or the section binding stops matching, which
+    is what keeps the check above from passing while inspecting nothing.
+    """
+    for md, _ in _pairs():
+        rows = _md_rows(md)
+        assert len(rows) == _EXPECTED_ROWS[md.name], (
+            f"{md.name}: parsed {len(rows)} bound rows, expected "
+            f"{_EXPECTED_ROWS[md.name]} — a row was added, removed, or is no "
+            f"longer being parsed"
+        )
+        # and no row may be counted twice: each (method, shape) appears once
+        keys = [(r[0], r[1], r[2], r[3]) for r in rows]
+        dupes = {k for k in keys if keys.count(k) > 1}
+        assert not dupes, f"{md.name}: duplicate rows for {sorted(dupes)[:3]}"
 
 
 def main():

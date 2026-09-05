@@ -1,0 +1,13 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Host-only gate for the registry's markdown-vs-JSON mirror: every per-method
+// table row must carry that method's tile, throughput, mean_rel_L1 and herd
+// from the JSON that calls itself the source of truth (review of #77). No
+// device, no downloads, and no ml_dtypes -- this one is stdlib only.
+//
+// RUN: %PYTHON %S/test_registry_tables.py | FileCheck %s
+//
+// CHECK: PASS  test_every_markdown_row_matches_its_own_methods_json_entry
+// CHECK: PASS  test_no_table_row_has_gone_missing
+// CHECK: registry table tests: 2/2 passed
