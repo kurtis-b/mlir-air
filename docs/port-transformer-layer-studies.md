@@ -70,8 +70,36 @@ than inherited, the risk is **smaller and differently shaped** than recorded:
 | Is `use_lock_race_condition_fix_v2` in the way? | **No, and it does not supersede v1.** They are different mechanisms: v1 inserts extra dummy DMA BDs; v2 daisy-chains locks for shared-L2 fan-in/fan-out buffers (`Conversion/Passes.td:208-222`), needs `air.no_split`, and has its own opt-out `air.no_chain_lock`. They are mutually exclusive — `xrt.py:311` raises if both are set — but this path needs only v1, which main already exposes. |
 | What is missing on main? | The driver-side half: main's `cache.py` supplies no `use_lock_race_condition_fix`, and main has no reader for the mark. |
 
-So the slice is: re-derive `herd_rows` onto air.api's `matvec.py`, port the mark-and-supply
-convention (builder stamp → dispatch reader → cache flag), and leave v2 alone. The measured wins
+So the slice *looked* like: re-derive `herd_rows` onto air.api's `matvec.py`, port the
+mark-and-supply convention, and leave v2 alone.
+
+**It is blocked, and the blocker is in the compiler — measured 2026-09-05, devq 928.** The
+plumbing was written and the default path verified byte-identical, but the path it enables does
+not compile on main:
+
+```
+make -f .../matrix_vector_multiplication/bf16/Makefile run \
+     M=2048 K=8192 TILE_M=2 M_INPUT=1 HERD_M=4 HERD_ROWS=2
+->  aircc: mlir/lib/IR/MLIRContext.cpp:1251: AffineMap::get(...):
+    Assertion `willBeValidAffineMap(...)' failed.
+    AIRSplitL2MemrefForBufferConstraintPass::runOnOperation()
+      -> xilinx::tileChannelOpByFactor(...)
+        -> mlir::AffineMap::replace(...)
+```
+
+devq 928, Turbo: the two configs the npu2 lit runs today **PASS unchanged** at the default, and
+the 2-row config aborts. So the plumbing is sound and the default is safe — the split-L2 pass
+simply cannot tile the channel access pattern a 2-row herd produces.
+
+**Consequence for the port's order, which the plan did not state: this E-cluster family has an
+F-cluster prerequisite.** Not the marker attribute — that really is Python-only, as measured above
+— but the split-L2 pass itself, whose remaining rows are still in F's 5,760. The LM-head / idle-row
+family cannot land before that compiler work, and any plan that schedules it as an E-side slice
+will hit this abort on its first device run.
+
+The plumbing is preserved, unmerged, on `feat/matvec-herd-rows` (`0b7a27a8`) with its evidence in
+the commit message; it is deliberately **not** proposed for main, because a CLI knob that aborts
+the compiler is worse than no knob. The measured wins
 this unlocks are the plan's, cited above with their devq ids, and **none has been re-measured on
 main** — the port must land its own before/after, not carry those numbers forward.
 
