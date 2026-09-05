@@ -1288,6 +1288,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#next-slice-the-lm-head-idle-row-family-risk-measured-2026-09-05-against-460aadcc" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Next slice: the LM-head / idle-row family — risk measured 2026-09-05 against 460aadcc
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#slice-order" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1460,6 +1471,39 @@ main has already retired — moot, and recorded with that history so a later aud
 <code>channel_examples</code> churn) are left in Remaining until each is measured the same way. The plan
 estimates ~5,900 lines close in total against its own branch-added accounting; only what has been
 re-verified against current main is moved here.</p>
+<h2 id="next-slice-the-lm-head-idle-row-family-risk-measured-2026-09-05-against-460aadcc">Next slice: the LM-head / idle-row family — risk measured 2026-09-05 against <code>460aadcc</code><a class="headerlink" href="#next-slice-the-lm-head-idle-row-family-risk-measured-2026-09-05-against-460aadcc" title="Permanent link">&para;</a></h2>
+<p>The split plan calls this "the biggest re-derivation risk in this whole plan". Measured rather
+than inherited, the risk is <strong>smaller and differently shaped</strong> than recorded:</p>
+<table>
+<thead>
+<tr>
+<th>question</th>
+<th>answer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Does main's <code>matvec.py</code> still have <code>herd_rows</code>?</td>
+<td><strong>No.</strong> Tag: 26 references, raw bindings. Main: <strong>0</strong>, fully air.api (#1849). This is the real work.</td>
+</tr>
+<tr>
+<td>Does the marker need a compiler change?</td>
+<td><strong>No.</strong> <code>air.lock_race_fix_required</code> appears in <strong>neither</strong> compiler — not the tag's <code>mlir/</code>, not main's. It is a pure Python convention: <code>matvec.py</code> stamps the herd at <code>herd_rows &gt; 1</code>, <code>dispatch.py</code> reads it, and <code>KernelCache.compile_and_cache</code> supplies <code>use_lock_race_condition_fix</code> "for that mark and for no other reason". No F-cluster dependency.</td>
+</tr>
+<tr>
+<td>Is <code>use_lock_race_condition_fix_v2</code> in the way?</td>
+<td><strong>No, and it does not supersede v1.</strong> They are different mechanisms: v1 inserts extra dummy DMA BDs; v2 daisy-chains locks for shared-L2 fan-in/fan-out buffers (<code>Conversion/Passes.td:208-222</code>), needs <code>air.no_split</code>, and has its own opt-out <code>air.no_chain_lock</code>. They are mutually exclusive — <code>xrt.py:311</code> raises if both are set — but this path needs only v1, which main already exposes.</td>
+</tr>
+<tr>
+<td>What is missing on main?</td>
+<td>The driver-side half: main's <code>cache.py</code> supplies no <code>use_lock_race_condition_fix</code>, and main has no reader for the mark.</td>
+</tr>
+</tbody>
+</table>
+<p>So the slice is: re-derive <code>herd_rows</code> onto air.api's <code>matvec.py</code>, port the mark-and-supply
+convention (builder stamp → dispatch reader → cache flag), and leave v2 alone. The measured wins
+this unlocks are the plan's, cited above with their devq ids, and <strong>none has been re-measured on
+main</strong> — the port must land its own before/after, not carry those numbers forward.</p>
 <h2 id="slice-order">Slice order<a class="headerlink" href="#slice-order" title="Permanent link">&para;</a></h2>
 <p>Shared infra (B: devq) → compiler rows that are self-contained (H10 non-constant BD offset refusal,
 <code>92b05de9</code> shared-L1 lock placement, shrink extent, split-L2 B/C/D, H3 verifier) → the <code>?</code> rows
