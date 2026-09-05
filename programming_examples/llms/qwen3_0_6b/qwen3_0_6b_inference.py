@@ -37,6 +37,8 @@ from shared.infra.driver import (  # noqa: F401
     tokenize_prompt as _tokenize_prompt,
     generate as _shared_generate,
     run_npu_prefill as _shared_run_npu_prefill,
+    run_lm_head as _shared_run_lm_head,
+    free_original_weight_numpy as _free_original_weight_numpy,
 )
 from qwen3_0_6b_prefill import (
     compile_all_kernels,
@@ -180,20 +182,17 @@ def prepare_runtime(
     decode_cache.profiler.preprocessing_s = t_prep
 
 
-def _free_original_weight_numpy(weights, config):
-    """Collapse host numpy originals to zero-stride broadcasts after prefill
-    preload. Weights are resident in the prefill BOs and passed as static
-    inputs, so only their dtype/shape metadata is read afterward."""
-    import gc
-
-    z = np.zeros((), dtype=bfloat16)
-    for layer_idx in range(config.n_layers):
-        lw = weights.layers[layer_idx]
-        for attr in ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down"):
-            a = getattr(lw, attr, None)
-            if a is not None and getattr(a, "size", 0) > 1:
-                setattr(lw, attr, np.broadcast_to(z, a.shape))
-    gc.collect()
+def _run_lm_head(decode_cache, weights, x_normed_bf16, vocab_size):
+    """This model's vocabulary split and backend, through the shared driver."""
+    return _shared_run_lm_head(
+        decode_cache,
+        weights,
+        x_normed_bf16,
+        vocab_size,
+        lm_gemv_backend=_lm_gemv_backend,
+        n_partitions=_LM_N_PARTITIONS,
+        n_part=_LM_N_PART,
+    )
 
 
 def _preload_decode_weights(decode_cache, weights, config):
@@ -317,29 +316,6 @@ def _preload_decode_weights(decode_cache, weights, config):
 # ---------------------------------------------------------------------------
 # NPU LM-head (19-partition GEMV) — shared by prefill end + decode.
 # ---------------------------------------------------------------------------
-
-
-def _run_lm_head(decode_cache, weights, x_normed_bf16, vocab_size):
-    lm_inputs = [x_normed_bf16.flatten().astype(bfloat16)]
-    out_idx = []
-    for p in range(_LM_N_PARTITIONS):
-        lm_inputs.append(weights._lm_weight_parts_gemv[p])
-        lm_inputs.append(np.zeros(_LM_N_PART, dtype=bfloat16))
-        out_idx.append(2 + 2 * p)
-    res = decode_cache.load_and_run(
-        "lm_head_gemv",
-        _lm_gemv_backend(),
-        *lm_inputs,
-        output_indices=out_idx,
-        static_input_indices={1 + 2 * p for p in range(_LM_N_PARTITIONS)},
-        intermediate_indices={2 + 2 * p for p in range(_LM_N_PARTITIONS)},
-    )
-    logits = np.zeros(vocab_size, dtype=np.float32)
-    for p in range(_LM_N_PARTITIONS):
-        n_start = p * _LM_N_PART
-        n_end = min(n_start + _LM_N_PART, vocab_size)
-        logits[n_start:n_end] = res[2 + 2 * p][: n_end - n_start].astype(np.float32)
-    return logits
 
 
 # ---------------------------------------------------------------------------

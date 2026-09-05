@@ -38,6 +38,7 @@ from shared.infra.driver import (  # noqa: F401
     tokenize_prompt as _tokenize_prompt,
     generate as _shared_generate,
     run_npu_prefill as _shared_run_npu_prefill,
+    run_lm_head as _shared_run_lm_head,
 )
 from qwen25_3b_prefill import (
     compile_all_kernels,
@@ -315,26 +316,16 @@ def _preload_decode_weights(decode_cache, weights, config):
 
 
 def _run_lm_head(decode_cache, weights, x_normed_bf16, vocab_size):
-    lm_inputs = [x_normed_bf16.flatten().astype(bfloat16)]
-    out_idx = []
-    for p in range(_LM_N_PARTITIONS):
-        lm_inputs.append(weights._lm_weight_parts_gemv[p])
-        lm_inputs.append(np.zeros(_LM_N_PART, dtype=bfloat16))
-        out_idx.append(2 + 2 * p)
-    res = decode_cache.load_and_run(
-        "lm_head_gemv",
-        _lm_gemv_backend(),
-        *lm_inputs,
-        output_indices=out_idx,
-        static_input_indices={1 + 2 * p for p in range(_LM_N_PARTITIONS)},
-        intermediate_indices={2 + 2 * p for p in range(_LM_N_PARTITIONS)},
+    """This model's vocabulary split and backend, through the shared driver."""
+    return _shared_run_lm_head(
+        decode_cache,
+        weights,
+        x_normed_bf16,
+        vocab_size,
+        lm_gemv_backend=_lm_gemv_backend,
+        n_partitions=_LM_N_PARTITIONS,
+        n_part=_LM_N_PART,
     )
-    logits = np.zeros(vocab_size, dtype=np.float32)
-    for p in range(_LM_N_PARTITIONS):
-        n_start = p * _LM_N_PART
-        n_end = min(n_start + _LM_N_PART, vocab_size)
-        logits[n_start:n_end] = res[2 + 2 * p][: n_end - n_start].astype(np.float32)
-    return logits
 
 
 # ---------------------------------------------------------------------------

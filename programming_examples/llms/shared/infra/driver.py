@@ -19,6 +19,10 @@ passed in — goal 6c's injection contract.
     delta_text         6 copies,  30 lines   nothing
     run_npu_prefill    6 copies, 474 lines   this model's transformer block,
                                              rms_norm, LM-head and eps
+    run_lm_head        6 copies, 126 lines   this model's vocabulary split
+                                             (_LM_N_PARTITIONS/_LM_N_PART) and
+                                             backend selector
+    free_original_...  5 copies, 100 lines   nothing (qwen25_3b never had it)
 
 `generate`'s six copies hashed as two bodies, but the two differ by exactly one
 line — the banner string — so `label` is a parameter and the rest is shared.
@@ -61,6 +65,9 @@ Measured on 2026-09-04, per consolidation, all under Turbo, all rc=0:
                                                         config family, so both
                                                         injected transformer
                                                         blocks are covered
+    lm_head + free-  (devq 924 baseline,     926 after)   3/3 models identical
+    weights helpers  (devq 925 before,       927 after)   `make verify` PASS both
+                                                        sides on both families
 
 Each baseline reproduced its predecessor byte-for-byte (913 == 914 == 916 == 918
 == 920),
@@ -466,3 +473,57 @@ def run_npu_prefill(
     if not quiet:
         print(f"NPU prefill done in {t_prefill:.2f}s. First token: {prefill_token}")
     return prefill_token, logits_row, k_cache, v_cache, prompt_len
+
+
+def free_original_weight_numpy(weights, config):
+    """Collapse host numpy originals to zero-stride broadcasts after prefill
+    preload. Weights are resident in the prefill BOs and passed as static
+    inputs, so only their dtype/shape metadata is read afterward."""
+    import gc
+
+    z = np.zeros((), dtype=bfloat16)
+    for layer_idx in range(config.n_layers):
+        lw = weights.layers[layer_idx]
+        for attr in ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down"):
+            a = getattr(lw, attr, None)
+            if a is not None and getattr(a, "size", 0) > 1:
+                setattr(lw, attr, np.broadcast_to(z, a.shape))
+    gc.collect()
+
+
+def run_lm_head(
+    decode_cache,
+    weights,
+    x_normed_bf16,
+    vocab_size,
+    *,
+    lm_gemv_backend,
+    n_partitions,
+    n_part,
+):
+    """The partitioned NPU LM-head GEMV.
+
+    `n_partitions`/`n_part` are this model's vocabulary split (`_LM_N_PARTITIONS`
+    and `_LM_N_PART`) and `lm_gemv_backend` its backend selector — all three live
+    in `<model>_decode`, which is why they are injected rather than imported.
+    """
+    lm_inputs = [x_normed_bf16.flatten().astype(bfloat16)]
+    out_idx = []
+    for p in range(n_partitions):
+        lm_inputs.append(weights._lm_weight_parts_gemv[p])
+        lm_inputs.append(np.zeros(n_part, dtype=bfloat16))
+        out_idx.append(2 + 2 * p)
+    res = decode_cache.load_and_run(
+        "lm_head_gemv",
+        lm_gemv_backend(),
+        *lm_inputs,
+        output_indices=out_idx,
+        static_input_indices={1 + 2 * p for p in range(n_partitions)},
+        intermediate_indices={2 + 2 * p for p in range(n_partitions)},
+    )
+    logits = np.zeros(vocab_size, dtype=np.float32)
+    for p in range(n_partitions):
+        n_start = p * n_part
+        n_end = min(n_start + n_part, vocab_size)
+        logits[n_start:n_end] = res[2 + 2 * p][: n_end - n_start].astype(np.float32)
+    return logits
