@@ -58,6 +58,23 @@ The plan's unnumbered residue rows (smollm2_1_7b_int4 deltas, int4_awq study too
 estimates ~5,900 lines close in total against its own branch-added accounting; only what has been
 re-verified against current main is moved here.
 
+## Next slice: the LM-head / idle-row family — risk measured 2026-09-05 against `460aadcc`
+
+The split plan calls this "the biggest re-derivation risk in this whole plan". Measured rather
+than inherited, the risk is **smaller and differently shaped** than recorded:
+
+| question | answer |
+|---|---|
+| Does main's `matvec.py` still have `herd_rows`? | **No.** Tag: 26 references, raw bindings. Main: **0**, fully air.api (#1849). This is the real work. |
+| Does the marker need a compiler change? | **No.** `air.lock_race_fix_required` appears in **neither** compiler — not the tag's `mlir/`, not main's. It is a pure Python convention: `matvec.py` stamps the herd at `herd_rows > 1`, `dispatch.py` reads it, and `KernelCache.compile_and_cache` supplies `use_lock_race_condition_fix` "for that mark and for no other reason". No F-cluster dependency. |
+| Is `use_lock_race_condition_fix_v2` in the way? | **No, and it does not supersede v1.** They are different mechanisms: v1 inserts extra dummy DMA BDs; v2 daisy-chains locks for shared-L2 fan-in/fan-out buffers (`Conversion/Passes.td:208-222`), needs `air.no_split`, and has its own opt-out `air.no_chain_lock`. They are mutually exclusive — `xrt.py:311` raises if both are set — but this path needs only v1, which main already exposes. |
+| What is missing on main? | The driver-side half: main's `cache.py` supplies no `use_lock_race_condition_fix`, and main has no reader for the mark. |
+
+So the slice is: re-derive `herd_rows` onto air.api's `matvec.py`, port the mark-and-supply
+convention (builder stamp → dispatch reader → cache flag), and leave v2 alone. The measured wins
+this unlocks are the plan's, cited above with their devq ids, and **none has been re-measured on
+main** — the port must land its own before/after, not carry those numbers forward.
+
 ## Slice order
 
 Shared infra (B: devq) → compiler rows that are self-contained (H10 non-constant BD offset refusal,
