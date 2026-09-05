@@ -654,5 +654,115 @@ def test_each_shim_binds_its_own_transformer_block_and_eps():
         assert getattr(kw["run_lm_head"], "id", None) == "_run_lm_head", m
 
 
+# --- the two remaining shared helpers (slice 5) ---------------------------
+
+LM_MODELS = [
+    "qwen25_0_5b",
+    "qwen25_1_5b",
+    "qwen25_3b",
+    "qwen3_0_6b",
+    "qwen3_1_7b",
+    "qwen3_4b",
+]
+
+
+def test_free_original_weight_numpy_keeps_shape_and_drops_storage():
+    layer = SimpleNamespace(
+        wq=np.ones((4, 4), dtype=bfloat16),
+        wk=np.ones((2, 4), dtype=bfloat16),
+        w_down=np.ones((4, 8), dtype=bfloat16),
+        w_up=None,  # absent attributes must be tolerated
+        # size-1 and left alone by the `size > 1` guard. It must be one of the
+        # attributes the function actually iterates, and shape (1,) not 0-d: a
+        # 0-d array broadcasts to identical strides, so neither an unlisted
+        # attribute nor a 0-d one can tell whether the guard is there.
+        w_gate=np.ones((1,), dtype=bfloat16),
+    )
+    gate_before = layer.w_gate
+    weights = SimpleNamespace(layers=[layer])
+    driver.free_original_weight_numpy(weights, SimpleNamespace(n_layers=1))
+    for attr, shape in (("wq", (4, 4)), ("wk", (2, 4)), ("w_down", (4, 8))):
+        a = getattr(layer, attr)
+        assert a.shape == shape, (attr, a.shape)
+        assert a.strides == (0, 0), (attr, a.strides)  # zero-stride broadcast
+    assert layer.w_up is None
+    # the size-1 array must be the SAME object, not a broadcast of it
+    assert layer.w_gate is gate_before, "size-1 arrays must be left alone"
+    assert layer.w_gate.strides == gate_before.strides
+
+
+def test_run_lm_head_assembles_logits_from_every_partition():
+    seen = {}
+
+    class _DC:
+        def load_and_run(self, name, backend, *inputs, **kw):
+            seen["name"] = name
+            seen["backend"] = backend
+            seen["kw"] = kw
+            seen["n_inputs"] = len(inputs)
+            # two partitions -> results at indices 2 and 4
+            return {2: np.array([1.0, 2.0]), 4: np.array([3.0, 4.0])}
+
+    weights = SimpleNamespace(_lm_weight_parts_gemv=["W0", "W1"])
+    out = driver.run_lm_head(
+        _DC(),
+        weights,
+        np.ones((1, 3), dtype=bfloat16),
+        4,
+        lm_gemv_backend=lambda: "BACKEND",
+        n_partitions=2,
+        n_part=2,
+    )
+    assert list(out) == [1.0, 2.0, 3.0, 4.0], out
+    assert out.dtype == np.float32
+    assert seen["name"] == "lm_head_gemv" and seen["backend"] == "BACKEND"
+    assert seen["n_inputs"] == 5  # x + (weight, zeros) per partition
+    assert seen["kw"]["static_input_indices"] == {1, 3}
+    assert seen["kw"]["intermediate_indices"] == {2, 4}
+
+
+def test_run_lm_head_truncates_the_last_partition_to_vocab_size():
+    class _DC:
+        def load_and_run(self, name, backend, *inputs, **kw):
+            return {2: np.array([1.0, 2.0]), 4: np.array([3.0, 9.0])}
+
+    out = driver.run_lm_head(
+        _DC(),
+        SimpleNamespace(_lm_weight_parts_gemv=["W0", "W1"]),
+        np.ones((1, 3), dtype=bfloat16),
+        3,  # vocab 3, so the last partition contributes one element, not two
+        lm_gemv_backend=lambda: "B",
+        n_partitions=2,
+        n_part=2,
+    )
+    assert list(out) == [1.0, 2.0, 3.0], out
+
+
+def test_each_shim_binds_its_own_lm_head_partitioning():
+    for m in LM_MODELS:
+        tree = ast.parse((_LLMS / m / f"{m}_inference.py").read_text())
+        fn = [
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_run_lm_head"
+        ]
+        assert len(fn) == 1, m
+        call = [n for n in ast.walk(fn[0]) if isinstance(n, ast.Call)][0]
+        kw = {k.arg: getattr(k.value, "id", None) for k in call.keywords}
+        assert kw == {
+            "lm_gemv_backend": "_lm_gemv_backend",
+            "n_partitions": "_LM_N_PARTITIONS",
+            "n_part": "_LM_N_PART",
+        }, (m, kw)
+        origin = {}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom):
+                for a in n.names:
+                    origin[a.asname or a.name] = n.module or ""
+        # the partitioning must come from THIS model's decode module
+        for handle in ("_lm_gemv_backend", "_LM_N_PARTITIONS", "_LM_N_PART"):
+            assert origin.get(handle) == f"{m}_decode", (m, handle, origin.get(handle))
+
+
 if __name__ == "__main__":
     sys.exit(_main())
