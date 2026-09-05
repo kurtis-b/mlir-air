@@ -37,6 +37,7 @@ from shared.infra.driver import (  # noqa: F401
     run_once as _shared_run_once,
     tokenize_prompt as _tokenize_prompt,
     generate as _shared_generate,
+    run_npu_prefill as _shared_run_npu_prefill,
 )
 from qwen25_1_5b_prefill import (
     compile_all_kernels,
@@ -329,85 +330,16 @@ def _run_lm_head(decode_cache, weights, x_normed_bf16, vocab_size):
 # ---------------------------------------------------------------------------
 
 
-def run_npu_prefill(
-    token_ids,
-    weights,
-    config,
-    prefill_cache,
-    decode_cache,
-    rope_lut_bf16,
-    max_seq,
-    tokenizer,
-    cpu_attn=True,
-    profile=False,
-    quiet=False,
-):
-    """Run NPU prefill (28 Qwen2.5 layers) and extract KV cache.
-
-    Returns: (prefill_token, logits_row, k_cache, v_cache, prompt_len).
-    K cache stores k_roped (AFTER bias AND RoPE); V stores bias-added projection.
-    """
-    seq_len = len(token_ids)
-    emb_dim = config.emb_dim
-    n_kv_heads = config.n_kv_heads
-    head_dim = config.head_dim
-    vocab_size = weights.lm_head.shape[0]
-
-    k_cache = np.zeros((config.n_layers, n_kv_heads, max_seq, head_dim), dtype=bfloat16)
-    v_cache = np.zeros((config.n_layers, n_kv_heads, max_seq, head_dim), dtype=bfloat16)
-
-    with prefill_cache.profiler.time_cpu("embed_lookup"):
-        x_bf16 = weights.embed_table[token_ids].astype(np.float32).astype(bfloat16)
-
-    if not quiet:
-        print(f"Running NPU prefill ({config.n_layers} layers, seq_len={seq_len})...")
-    t_start = time.time()
-
-    for layer_idx in range(config.n_layers):
-        t0 = prefill_cache.profiler.start_layer()
-        x_bf16, inter = run_transformer_block_qwen25(
-            x_bf16,
-            weights.layers[layer_idx],
-            rope_lut_bf16,
-            config,
-            prefill_cache,
-            layer_idx=layer_idx,
-            cpu_attn=cpu_attn,
-            verbose=profile,
-        )
-        with prefill_cache.profiler.time_cpu("kv_cache_extract"):
-            k_roped = inter["k_roped"]
-            v_biased = inter["v"]
-            k_cache[layer_idx, :, :seq_len, :] = (
-                k_roped.astype(bfloat16)
-                .reshape(seq_len, n_kv_heads, head_dim)
-                .transpose(1, 0, 2)
-            )
-            v_cache[layer_idx, :, :seq_len, :] = (
-                v_biased.astype(bfloat16)
-                .reshape(seq_len, n_kv_heads, head_dim)
-                .transpose(1, 0, 2)
-            )
-        prefill_cache.profiler.end_layer(layer_idx, t0)
-
-    # Final RMSNorm (eps=1e-6) on the prediction-position row + NPU LM-head.
-    prompt_len = len([t for t in token_ids if t != tokenizer.eos_token_id])
-    pred_pos = prompt_len - 1
-    with prefill_cache.profiler.time_cpu("final_rms_norm"):
-        last_hidden = np.asarray(x_bf16, dtype=np.float32)[pred_pos : pred_pos + 1]
-        last_normed = (
-            rms_norm(last_hidden, weights.final_norm, eps=EPS)
-            .flatten()
-            .astype(bfloat16)
-        )
-
-    logits_row = _run_lm_head(decode_cache, weights, last_normed, vocab_size)
-    prefill_token = int(np.argmax(logits_row))
-
-    t_prefill = time.time() - t_start
-    if not quiet:
-        print(f"NPU prefill done in {t_prefill:.2f}s. First token: {prefill_token}")
-    return prefill_token, logits_row, k_cache, v_cache, prompt_len
+def run_npu_prefill(*args, **kw):
+    """This model's transformer block and helpers, through the shared driver."""
+    return _shared_run_npu_prefill(
+        *args,
+        run_transformer_block=run_transformer_block_qwen25,
+        rms_norm=rms_norm,
+        run_lm_head=_run_lm_head,
+        eps=EPS,
+        **kw,
+    )
 
 
 # ---------------------------------------------------------------------------
