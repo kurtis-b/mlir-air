@@ -36,6 +36,32 @@ from shared.infra.backend_presets import (
 # ---------------------------------------------------------------------------
 
 
+def build_lm_head_gemv_llama_module(emb_dim):
+    """The production head: 8 x 16384 rows (vocab 128256 + 2816 pad rows).
+
+    `m_input` 8 -- one kernel call per 8-row tile -- rather than the builder's
+    default 4. The research branch measured the head alone at 15.10 -> 13.91 ms
+    p50, interleaved x20 under Turbo (`1e234f18`, devq 563); that number is
+    the branch's, on its own tree, and is not re-measured here.
+
+    The partitions stay UNIFORM. The mixed 7 x 16384 + 13568 that drops the
+    2816 pad rows measured no gain at either `m_input` (15.15 / 14.16 ms
+    against 15.10 / 13.91; doc 57 section 5 item 5d), so the pad rows are
+    cheaper than the tail launch and the host slicing (`_LM_N_PART`) is
+    untouched -- unlike Qwen3-0.6B, whose vocabulary divides exactly and whose
+    head therefore did become mixed (#94).
+
+    Why `m_input` 8 is safe at 16384 rows here: the DMA repeat count scales
+    with `m / (m_input * herd_m)`, so raising `m_input` HALVES it. It is the
+    other direction that hits the `[0:255]` ceiling -- Qwen's untiled backend
+    at `m_input` 4 does (devq 944), while this model's `LM_GEMV_BACKEND`
+    carries `runtime_loop_tiling_sizes` and compiles either way (devq 945/946).
+    """
+    from shared.builders.lm_head_gemv_multi import build_lm_head_gemv_module
+
+    return build_lm_head_gemv_module(emb_dim, m_input=8)
+
+
 def compile_decode_kernels(cache, config):
     """Compile the 3 merged decode kernels."""
     from shared.infra.external_kernels import compile_all_external_kernels
@@ -77,13 +103,9 @@ def compile_decode_kernels(cache, config):
     )
 
     # 3. LM Head GEMV multi-launch: 8-partition GEMV in one ELF
-    from shared.builders.lm_head_gemv_multi import (
-        build_lm_head_gemv_module,
-    )
-
     cache.compile_and_cache(
         "lm_head_gemv",
-        build_lm_head_gemv_module(emb_dim),
+        build_lm_head_gemv_llama_module(emb_dim),
         {"verbose": cache.verbose, **LM_GEMV_BACKEND},
     )
 

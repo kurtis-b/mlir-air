@@ -28,7 +28,7 @@ N_TOKENS ?= 1000
 PROMPT   ?= What is the capital of France?
 MODEL    ?= instruct
 
-.PHONY: help compile run profile chat verify verify-full diagnosis clean
+.PHONY: help compile run profile chat verify verify-full diagnosis check-lm-head-reexec clean
 
 # ============================================================
 # Help
@@ -123,6 +123,11 @@ diagnosis:
 # ============================================================
 
 ## Remove all build artifacts and verify reports
+## LM-head ELF back-to-back re-execution gate (no HF weights)
+check-lm-head-reexec:
+	@mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/lm_head_reexec_gate.py lm_head_reexec_cache
+
 clean:
 	rm -r $(BUILD_DIR) 2>/dev/null || true
 	rm -rf $(srcdir)/../verify/reports
