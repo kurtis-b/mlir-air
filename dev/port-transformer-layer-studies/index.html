@@ -1665,8 +1665,38 @@ stay consistent — substitute, then canonicalise the map <em>and</em> its opera
 <code>canonicalizeMapAndOperands</code> is the obvious tool), dropping the now-unused symbol and its operand
 in one step. That needs the operand vector threaded into the compose lambda, which today returns a
 map alone; it is a real change, not a one-liner, and it is the next slice.</p>
+<p><strong>Attempted 2026-09-05, and it narrowed again rather than fixing:</strong></p>
+<table>
+<thead>
+<tr>
+<th>attempt</th>
+<th>result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>keep the map's own counts in <code>replace</code></td>
+<td>clears assert 1; pass runs <strong>32</strong> map constructions further, then assert 2</td>
+</tr>
+<tr>
+<td>+ <code>canonicalizeMapAndOperands</code> before building the apply</td>
+<td><strong>its own precondition asserts</strong> — it requires <code>map.getNumInputs() == operands.size()</code>, which does not hold at every call</td>
+</tr>
+<tr>
+<td>guard that call, then print both counts at the create site</td>
+<td><strong>every one of 16 constructions has <code>numInputs == operands.size()</code></strong> — e.g. <code>()[s0] -&gt; (s0 * 16 + 12)</code>, 1 input, 1 operand</td>
+</tr>
+</tbody>
+</table>
+<p><strong>That last row is the useful one, and it overturns the obvious reading of assert 2.</strong> The rebuilt
+<code>affine.apply</code> is <em>not</em> created with a mismatched operand list — the mismatch appears <strong>downstream</strong>
+of construction, when something later folds a map against a different input count. So the fix is
+not at <code>AffineApplyOp::create</code>, and the next session should start by finding which consumer of the
+rewritten apply (or which reuse of <code>map</code> after it) sees the inconsistent pair.</p>
 <p>Both asserts are reproducible in seconds against the committed input above, so a candidate can be
-checked before it is believed.
+checked before it is believed — that is how <code>971bab2a</code>, "keep the counts", and now "canonicalize at
+the create site" were each eliminated. No compiler change is proposed from any of them; the tree is
+clean.
 Any plan that schedules the LM-head family as an E-side slice hits this abort on its first device
 run.</p>
 <p>The plumbing is preserved, unmerged, on <code>feat/matvec-herd-rows</code> (<code>0b7a27a8</code>) with its evidence in
