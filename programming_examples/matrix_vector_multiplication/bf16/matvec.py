@@ -35,6 +35,33 @@ The L2 buffers are flat here -- ``[herd_m * tile_m, k]`` rather than
 ``[herd_m, tile_m, k]``. Row-major, those are the same bytes; keeping it flat
 makes the fill a plain shape-matching transfer and lets a core slice its own
 window out with arithmetic on its column index.
+
+``herd_rows`` (default 1) is how many of the device's four core ROWS the herd
+occupies. **At the default it is inert, and that is checked rather than
+asserted** -- ten call sites in ``programming_examples/llms/`` parse
+``str(build_module(...))`` as MLIR text, so a default that gained a herd
+dimension would change all of them::
+
+    for r in "" "--herd-rows 1" "--herd-rows 2"; do
+      python3 matvec.py --print-module-only --m 2048 --k 8192 --tile-m 2 \
+        --m-input 1 --herd-m 4 $r --target npu2
+    done
+
+Measured 2026-09-06 against this file's parameter-less predecessor
+(``origin/main`` at ``3f2dc181``, emitted module md5
+``bb9095e3746f55ea8286deb56ac2e78d``, against ``25889a098fe3031c594f61eae0c848da``
+at two rows): the default and an explicit ``--herd-rows 1``
+are **byte-identical** to it, and ``--herd-rows 2`` **differs** -- the control
+that shows the comparison can see a change at all, rather than passing because
+the flag does nothing. Its first divergence is the offset map going from
+``()[s0, s1] -> (s0 * 2 + s1)`` to ``()[s0, s1, s2] -> (s0 * 4 + s1 * 2 + s2)``.
+
+That third symbol is exactly what ``air-split-l2-memref`` cannot yet handle, so
+``herd_rows > 1`` currently stops at a compiler diagnostic rather than running.
+The knob is here anyway because it is a prerequisite for the LM-head builder,
+whose partitions pass ``herd_rows`` unconditionally; the defect behind the
+limit, its committed reproducer and its analysis are in
+``docs/port-transformer-layer-studies.md``.
 """
 
 import argparse
@@ -66,6 +93,7 @@ def build_module(
     np_dtype_out,
     link_with="mv.o",
     target="auto",
+    herd_rows=1,
 ):
     """Build the GEMV module. Returns an ``air.ir.Module``.
 
@@ -76,30 +104,35 @@ def build_module(
     ``<air.api._compile.LaunchContext object at 0x...>``, which those parsers
     accepted silently and then failed on with an unrelated TypeError.
     """
+    assert 1 <= herd_rows <= 4, (
+        f"herd_rows ({herd_rows}) must be 1..4: NPU2 has four core rows " f"(rows 2..5)"
+    )
+    band = tile_m * herd_m * herd_rows
     assert (
-        m % (tile_m * herd_m) == 0
-    ), f"M ({m}) must be divisible by tile_m * herd_m ({tile_m * herd_m})"
+        m % band == 0
+    ), f"M ({m}) must be divisible by tile_m * herd_m * herd_rows ({band})"
     assert (
         tile_m % m_input == 0
     ), f"tile_m ({tile_m}) must be divisible by m_input ({m_input})"
     assert k % 64 == 0, f"K ({k}) must be divisible by 64 (vector width)"
 
     # Guard MemTile/L2 capacity for staged A and C tiles.
-    a_l2_bytes = herd_m * tile_m * k * np.dtype(np_dtype_in).itemsize
-    c_l2_bytes = herd_m * tile_m * np.dtype(np_dtype_out).itemsize
+    a_l2_bytes = band * k * np.dtype(np_dtype_in).itemsize
+    c_l2_bytes = band * np.dtype(np_dtype_out).itemsize
     assert a_l2_bytes + c_l2_bytes <= L2_CAPACITY, (
         f"L2 capacity exceeded: A={a_l2_bytes}B + C={c_l2_bytes}B = "
         f"{a_l2_bytes + c_l2_bytes}B > {L2_CAPACITY}B. "
-        f"Reduce herd_m ({herd_m}), tile_m ({tile_m}), or k ({k})."
+        f"Reduce herd_m ({herd_m}), herd_rows ({herd_rows}), tile_m "
+        f"({tile_m}), or k ({k})."
     )
 
     dt_in, dt_out = DTYPE[np_dtype_in], DTYPE[np_dtype_out]
 
     # The extent of one L2 staging tile, which the launch steps by: each launch
-    # point owns herd_m * tile_m output rows. Named for what it dimensions
-    # rather than for the hierarchy level that consumes it -- air.launch,
-    # air.segment and air.herd each own a separate iteration space.
-    l2_m = tile_m * herd_m
+    # point owns tile_m * herd_m * herd_rows output rows. Named for what it
+    # dimensions rather than for the hierarchy level that consumes it --
+    # air.launch, air.segment and air.herd each own a separate iteration space.
+    l2_m = band
 
     # The kernel and the fill live in the same object file and are linked into
     # the herd by air.extern. The three leading i32s are rows, K and the row
@@ -141,17 +174,28 @@ def build_module(
                     # herd_m wider than the part has columns should fail in the
                     # placer, as it did before, not silently strip-mine onto
                     # fewer cores and run at a fraction of the speed.
-                    with air.herd([range(herd_m)], name="herd_0", shape=(herd_m,)) as h:
+                    # herd_rows == 1 keeps the ORIGINAL 1-D herd, emitted
+                    # byte-for-byte as before. Ten call sites in
+                    # programming_examples/llms parse str(build_module(...)) as
+                    # MLIR text, so the default must not gain a herd dimension
+                    # (a shape-(herd_m, 1) herd is behaviourally the same but
+                    # is not the same IR); the 2-D form appears only when the
+                    # extra rows are actually asked for.
+                    herd_sizes = (
+                        [range(herd_m)]
+                        if herd_rows == 1
+                        else [range(herd_m), range(herd_rows)]
+                    )
+                    herd_shape = (herd_m,) if herd_rows == 1 else (herd_m, herd_rows)
+                    with air.herd(herd_sizes, name="herd_0", shape=herd_shape) as h:
 
-                        @h.body
-                        def _(tx):
+                        def _core(base):
                             l1_a = air.alloc([m_input, k], dt_in, scope=h.private())
                             l1_b = air.alloc([k], dt_in, scope=h.private())
                             l1_c = air.alloc([tile_m], dt_out, scope=h.private())
 
                             fill(l1_c)
 
-                            base = tx * tile_m
                             for j in air.sequential(0, tile_m, m_input):
                                 # B is the same vector for every core and every
                                 # trip; loading it here is what lets
@@ -163,6 +207,24 @@ def build_module(
                                 matvec(m_input, k, j, l1_a, l1_b, l1_c)
 
                             air.ops.store(l1_c, l2_c[base : base + tile_m])
+
+                        # air.api reads the body's arity to check it against the
+                        # iteration space, so each herd shape needs its own
+                        # signature; the work itself is shared. Column tx owns a
+                        # contiguous run of tile_m * herd_rows rows and row ty
+                        # takes the ty-th tile_m slice of it, which at
+                        # herd_rows == 1 is the original tx * tile_m.
+                        if herd_rows == 1:
+
+                            @h.body
+                            def _(tx):
+                                _core(tx * tile_m)
+
+                        else:
+
+                            @h.body
+                            def _(tx, ty):
+                                _core((tx * herd_rows + ty) * tile_m)
 
                     air.ops.store(l2_c, C[row : row + l2_m])
 
@@ -226,6 +288,13 @@ if __name__ == "__main__":
         help="Number of AIE columns (parallel compute tiles along M dimension)",
     )
     parser.add_argument(
+        "--herd-rows",
+        type=int,
+        default=1,
+        help="AIE core rows per column (1..4). >1 fills otherwise-idle rows: "
+        "each column then owns tile_m * herd_rows output rows",
+    )
+    parser.add_argument(
         "--output-format",
         type=str,
         choices=["xclbin", "elf"],
@@ -277,6 +346,7 @@ if __name__ == "__main__":
         INPUT_DATATYPE,
         OUTPUT_DATATYPE,
         target=args.target,
+        herd_rows=args.herd_rows,
     )
     if args.print_module_only:
         print(mlir_module)
