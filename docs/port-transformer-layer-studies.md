@@ -187,6 +187,42 @@ candidate fix can be checked against it by anyone, which is how `971bab2a` was e
 
 **What it is not**: the same shape as the `multi_symbol_offset` lit (which passes on main, ported
 in #82), and not fixed by `971bab2a`.
+
+### Root cause, diagnosed by instrumentation 2026-09-05 — TWO asserts, not one
+
+Printing the maps as `tileChannelOpByFactor` builds them (temporary `llvm::errs()` in
+`mapForExpr` and the compose lambda, reverted) gives the sequence:
+
+```
+[DBG compose] original_map=()[s0, s1] -> (s0 * 2 + s1)   originalExpr=s0     <- then abort
+```
+
+**Assert 1 — an invalid map.** `composeAffineExprWithOffsetAndAffineMap` substitutes the split
+offset with
+
+```cpp
+original_map.replace(getAffineSymbolExpr(0, ctx), const, /*dims=*/0, /*syms=*/1)
+```
+
+Those counts are hardcoded. With the **two**-symbol map above, substituting `s0` leaves `s1` —
+symbol position 1 — inside a map declared to hold one symbol, so `AffineMap::get` asserts on
+`willBeValidAffineMap`. A multi-symbol offset is exactly what a multi-level loop nest produces,
+which is why a 2-row herd triggers it and a 1-row herd never did.
+
+**Assert 2 — operands out of step with the map.** Preserving the map's own counts
+(`original_map.getNumDims(), original_map.getNumSymbols()`) clears assert 1 and the pass runs
+**32 map constructions further** — then aborts in `AffineMap::partialConstantFold` on
+`getNumInputs(...)`: the map now correctly declares two symbols, while the operand list handed to
+the rebuilt `affine.apply` no longer matches it, because one symbol became a constant.
+
+**So the fix is not "keep the counts".** Substituting into the map and rebuilding the apply have to
+stay consistent — substitute, then canonicalise the map *and* its operands together (MLIR's
+`canonicalizeMapAndOperands` is the obvious tool), dropping the now-unused symbol and its operand
+in one step. That needs the operand vector threaded into the compose lambda, which today returns a
+map alone; it is a real change, not a one-liner, and it is the next slice.
+
+Both asserts are reproducible in seconds against the committed input above, so a candidate can be
+checked before it is believed.
 Any plan that schedules the LM-head family as an E-side slice hits this abort on its first device
 run.
 
