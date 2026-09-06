@@ -345,19 +345,46 @@ the map has one symbol that is the substitution already performed, so no working
 that pins the diagnostic it removes. The reviewer's `opToSplitInfoMap`-while-iterating candidate is
 *not* the mechanism — that loop copies nothing on this input (0 `UNROLL-COPY` events).
 
-**It is still not landable, because clearing the abort exposes a second, independent defect.** The
-S2MM side mis-splits a 2-row herd: every L2 buffer holding herd row 1's outputs is filled and then
-only deallocated.
+**It is still not landable, because clearing the abort exposes a second, independent defect** — and
+it is symmetric: for a 2-row herd the second row's transfers are not connected at *either* end.
 
-| L2 C buffer | shape | `channel.get` | `channel.put` to L3 |
-|---|---|---|---|
-| `%results_31/33/35/37` | `memref<2xbf16, 1>` | 1 | **0 — never drained** |
-| `%results_39/41/43/45` | `memref<4xbf16, 1>` | 1 (writes 2 of 4) | 1 (drains 4) |
+```
+buffer          shape                 gets  puts  note
+%results_17     2x8192xbf16              0     1  <-- never filled     (A, L3->L2 missing)
+%results_21     2x8192xbf16              0     1  <-- never filled
+%results_25     2x8192xbf16              0     1  <-- never filled
+%results_29     2x8192xbf16              0     1  <-- never filled
+%results_31     2xbf16                   1     0  <-- NEVER DRAINED    (C, L2->L3 missing)
+%results_33     2xbf16                   1     0  <-- NEVER DRAINED
+%results_35     2xbf16                   1     0  <-- NEVER DRAINED
+%results_37     2xbf16                   1     0  <-- NEVER DRAINED
+```
 
-Half of C would be dropped and half left garbage. Those maps carry **one** symbol, so this path is
-untouched by the substitution: it is pre-existing, and was masked by the abort. A compiler that
-silently drops half an output is worse than one that refuses, so main keeps the #88 diagnostic and
-the fix stays unlanded on `fix/split-l2-multi-symbol` (`78877b71`), evidence in its commit message.
+Four A slabs are pushed to the herd having never been filled from L3, and four C buffers are filled
+by the herd and never drained back. Half of A is undefined and half of C is dropped. Those maps
+carry **one** symbol, so this path is untouched by the substitution: it is pre-existing, and was
+merely masked by the abort. A compiler that silently drops half an output is worse than one that
+refuses, so main keeps the #88 diagnostic and the fix stays unlanded on `fix/split-l2-multi-symbol`
+(`19dc50fd`).
+
+**Reproducing all of the above takes about a minute, and what is committed is the generators** rather
+than the logs — on that same branch, `agents/scripts/split_l2_liveness.py` plus three
+`AIR_SPLIT_L2_PROBE`-guarded probes (record site, compose site, unroll-copy loop), all inert unless
+the variable is set:
+
+```
+git switch fix/split-l2-multi-symbol && ninja -C build-xrt air-opt
+cd mlir/test/Transform/AIRMiscPasses
+OPT=../../../../build-xrt/bin/air-opt
+ARGS="--air-split-l2-memref=max-launch-channels-mm2s=16 max-launch-channels-s2mm=16 tiles-per-l2-tile=4"
+AIR_SPLIT_L2_PROBE=1 $OPT Inputs/split_l2_herd_rows2_pre_split.mlir "$ARGS" >/dev/null  # RECORD/PROBE
+$OPT Inputs/split_l2_herd_rows2_pre_split.mlir "$ARGS" 2>/dev/null \
+  | python3 ../../../../agents/scripts/split_l2_liveness.py                             # the table
+```
+
+The liveness check is not vacuous, which was verified rather than assumed: pointed at
+`air_split_l2_memref.mlir` with its own RUN options — a working single-row split — it finds four
+real L2 buffers with live counts (20/7, 16/6, 15/5, 14/4) and **exits 0**.
 
 **Scope revised.** The blocker is not operand plumbing; it is that `air-split-l2-memref` does not
 model a herd whose *rows* subdivide the split dimension — the offset maps and the S2MM gather both
