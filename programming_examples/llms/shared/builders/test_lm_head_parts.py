@@ -8,13 +8,40 @@ stood before the parameter (read out of git), and spelling the same partitions
 out explicitly matches omitting them. The rest exercise the actual feature and
 its validation.
 
-Host-only: builds MLIR text, no device.
+The four cases above are host-only (MLIR text, no device) and are what the lit
+runner collects. `--device` adds a fifth thing they cannot answer: whether a
+module whose launches have DIFFERENT shapes actually LOWERS. That is the real
+risk in this change -- emitting the right text is not the same as compiling,
+which is exactly how the herd_rows path failed -- so it compiles two arms
+through the LM head's own backend preset:
+
+    equal  parts=[256, 256]   control: the shape main ships today
+    mixed  parts=[256, 128]   the new capability
+
+The control is load-bearing. Two earlier attempts failed BOTH arms and so said
+nothing about the change: devq 929 because the herds carry `link_with="mv.o"`
+and the working directory had none, and devq 931 because the xclbin path
+cannot express a multi-launch module at all (`aiecc: edge 'air.insts.bin'
+produced duplicate output path`) -- the drivers use `output_format="elf"` via
+`LM_GEMV_BACKEND`, which is why this reuses that preset rather than
+hand-rolled kwargs. **devq 932: both arms COMPILED OK**, exit 0, producing a
+204,984-byte `air.elf` whose `air.mlir` carries both `memref<128x2048xbf16>`
+and `memref<256x2048xbf16>` across 2 `air.launch` ops. That the same script
+reported FAIL at 931 and PASS at 932 on a one-line change is the evidence
+that it can go red. **devq 933 is the same run from THIS file** (same builder
+md5 348a7f3b), so what is recorded here is what the committed code does.
+
+    source agents/.state/tlenv.sh
+    python3 test_lm_head_parts.py --device
 """
 
+import hashlib
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -94,7 +121,58 @@ def test_a_partition_off_the_tile_grid_is_refused():
     raise AssertionError("a partition off the tile grid was accepted")
 
 
+def device_gate():
+    """Compile the equal and mixed arms through aircc. Needs the toolchain."""
+    root = Path(__file__).resolve().parents[4]
+    matvec = root / "programming_examples/matrix_vector_multiplication/bf16"
+    tile_m = 8
+
+    src = Path(__file__).with_name("lm_head_gemv_multi.py")
+    print("builder md5: %s" % hashlib.md5(src.read_bytes()).hexdigest())
+
+    # The herds carry link_with="mv.o", so aiecc needs that object in the
+    # working directory. Build it exactly as the example's own Makefile does.
+    subprocess.run(
+        ["make", "-C", str(matvec), "compile-kernel", "TILE_M=%d" % tile_m],
+        check=True,
+    )
+    workdir = matvec / "build_peano"
+    assert (workdir / "mv.o").exists(), "mv.o was not produced"
+    os.chdir(workdir)
+
+    sys.path.insert(0, str(root / "programming_examples/llms"))
+    from shared.infra.backend_presets import LM_GEMV_BACKEND
+    from air.backend.xrt import XRTBackend
+
+    shape = dict(emb_dim=2048, tile_m=tile_m, m_input=4, herd_m=8)
+    results = {}
+    for name, parts in [("equal", [256, 256]), ("mixed", [256, 128])]:
+        print("\n=== arm %s: parts=%s ===" % (name, parts), flush=True)
+        try:
+            module = builder.build_lm_head_gemv_module(parts=parts, **shape)
+            backend = XRTBackend(verbose=False, **LM_GEMV_BACKEND)
+            backend.compile(module)
+            backend.unload()
+            results[name] = True
+            print("  %s: COMPILED OK" % name, flush=True)
+        except Exception:
+            results[name] = False
+            print("  %s: FAILED" % name, flush=True)
+            traceback.print_exc()
+
+    print("\nresults: %s" % results, flush=True)
+    if not results.get("equal"):
+        # Without the control the mixed arm's outcome is uninterpretable.
+        print("CONTROL FAILED -- this run says nothing about the change")
+        return 2
+    print("lm_head parts device gate: %s" % ("PASS" if results["mixed"] else "FAIL"))
+    return 0 if results["mixed"] else 1
+
+
 if __name__ == "__main__":
+    if "--device" in sys.argv:
+        sys.exit(device_gate())
+
     tests = sorted(k for k in globals() if k.startswith("test_"))
     n_pass = 0
     for name in tests:
