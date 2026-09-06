@@ -1,0 +1,14 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Host-only: the LM-head builder's `parts` argument -- inert when omitted,
+// mixed partition sizes when given, and a partition off the tile grid
+// refused. Builds MLIR text only; no device, no checkpoint. One case reads
+// the pre-parameter builder out of git, so it runs inside the work tree.
+//
+// RUN: %PYTHON %S/test_lm_head_parts.py | FileCheck %s
+// CHECK: PASS  test_a_partition_off_the_tile_grid_is_refused
+// CHECK: PASS  test_mixed_parts_emit_both_shapes_and_one_launch_each
+// CHECK: PASS  test_omitting_parts_matches_the_pre_parameter_builder
+// CHECK: PASS  test_spelling_out_equal_parts_matches_omitting_them
+// CHECK: lm_head parts tests: 4/4 passed
