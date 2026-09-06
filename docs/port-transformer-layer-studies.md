@@ -227,13 +227,11 @@ map alone; it is a real change, not a one-liner, and it is the next slice.
 |---|---|
 | keep the map's own counts in `replace` | clears assert 1; pass runs **32** map constructions further, then assert 2 |
 | + `canonicalizeMapAndOperands` before building the apply | **its own precondition asserts** — it requires `map.getNumInputs() == operands.size()`, which does not hold at every call |
-| guard that call, then print both counts at the create site | **every one of 16 constructions has `numInputs == operands.size()`** — e.g. `()[s0] -> (s0 * 16 + 12)`, 1 input, 1 operand |
+| guard that call, then print both counts at the create site | **RETRACTED — see the correction below.** The first 8 of 16 constructions are `numInputs=2, operands=1`; the 1/1 examples quoted here are the last 8 only. The check that produced this row errored out and was read as a pass. |
 
-**That last row is the useful one, and it overturns the obvious reading of assert 2.** The rebuilt
-`affine.apply` is *not* created with a mismatched operand list — the mismatch appears **downstream**
-of construction, when something later folds a map against a different input count. So the fix is
-not at `AffineApplyOp::create`, and the next session should start by finding which consumer of the
-rewritten apply (or which reuse of `map` after it) sees the inconsistent pair.
+**That last row was wrong and is retracted** (corrected in the section below): the rebuilt
+`affine.apply` **is** created with a mismatched operand list in 8 of 16 cases. The "downstream"
+conclusion drawn from it does not hold.
 
 **Where assert 2 actually comes from (2026-09-05, backtrace + three probes):**
 
@@ -245,13 +243,28 @@ probes then bound where it can come from:
 | probe | result |
 |---|---|
 | is the committed input itself malformed? | **no** — it parses, `--verify-roundtrip`s and `--canonicalize`s clean (exit 0) |
-| does the pass's own `AffineApplyOp::create` build one? | **no** — the pass has exactly one such call, and all **16** constructions print `numInputs == operands.size()` |
+| does the pass's own `AffineApplyOp::create` build one? | **YES** — the first **8** of 16 constructions print `numInputs=2, operands=1`. (An earlier entry claimed all 16 matched; that came from a filter that errored out and a sorted `head` showing only the 1/1 tail. Corrected here.) |
 | do the `Util.cpp` offset-producer sites (1496, 1527) build one? | **not by inspection** — `composedMap` is built with `originalMap.getNumDims(), getNumSymbols()` and fed `affine_apply.getOperands()`, consistent by construction |
 
-So a malformed apply is produced **during** the pass, by neither of the two obvious constructors.
-The next step is to catch it at birth rather than reason about it: attach a rewriter listener (or a
-temporary check after each rewrite step in `tileChannelOpByFactor`) that verifies every
-`affine.apply` in the module, and report the first step that introduces the inconsistency.
+**So it IS built at the create site, and the earlier "downstream" conclusion is retracted.** The
+raw capture, in order:
+
+```
+2 inputs, 1 operand   ()[s0, s1] -> (s0 + s1)          <- first 8, all malformed
+2 inputs, 1 operand   ()[s0, s1] -> (s0 * 16 + s1 + 12)
+1 input,  1 operand   ()[s0] -> (s0)                   <- last 8, consistent
+```
+
+**The mechanism this points at**: `composeAffineExprWithOffsetAndAffineMap` returns
+`originalExpr + original_map.getResult(0)`. Those two expressions come from **different symbol
+spaces** — `originalExpr`'s symbols index `originalApplyOperands`, while the split-info map's
+symbols index its own operands — and adding them conflates `s0` of one with `s0` of the other while
+the operand list stays as the first one's. That is why the composed map wants 2 inputs and only 1
+operand is supplied. A fix has to rebase the second expression's symbols above the first's and
+concatenate the operand lists, not just add the expressions.
+
+Note the ordering: these malformed creates are only *reachable* once assert 1 is bypassed by the
+counts fix, which is why assert 2 appeared to be a separate downstream problem.
 
 Both asserts are reproducible in seconds against the committed input above, so a candidate can be
 checked before it is believed — that is how `971bab2a`, "keep the counts", and "canonicalize at the
