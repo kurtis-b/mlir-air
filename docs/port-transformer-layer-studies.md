@@ -337,16 +337,25 @@ FAIL: Transform/AIRMiscPasses/air_split_l2_memref.mlir
 A **segfault**, on an existing test, from adding a field nothing reads. Suite 538/553 with the
 change, back to **539/553 with it reverted**, so it is unambiguously the change.
 
-What that means: `infoEntryTy` was all-POD and therefore trivially copyable, and something in the
-pass copies or assigns an entry whose backing storage is no longer valid — a dangling reference
-into a container that reallocated, most likely, which a trivially-copyable tuple survives by
-accident and a heap-allocating member does not. **That is a latent lifetime bug in the pass,
-independent of the multi-symbol problem**, and it is now the first thing option (1) has to fix:
-carrying the operands is impossible until an `infoEntryTy` copy is safe.
+**The cause is NOT established, and a first attempt at explaining it was measured and refuted.**
+The tempting story — "the tuple was all-POD, so a dangling copy survived by accident until a
+heap-allocating member made it fatal" — rests on the old tuple being trivially copyable. It is not:
 
-Notably, the existing test that segfaults is the *single*-symbol one — so this defect has nothing
-to do with 2-row herds and would bite any change that puts a non-trivial member in that tuple.
-Reverted; no code proposed.
+```cpp
+static_assert(std::is_trivially_copyable<infoEntryTy>::value, ...);
+//  -> error: static assertion failed   (on the tuple as it stands today)
+```
+
+So that mechanism is wrong. `SmallVector<Value>` may also sit in inline storage, and the trace
+stops at `runOnOperation()` with no line info, so the copy site is unidentified. **What is
+established is only the A/B**: adding a field nothing reads crashes an existing single-symbol test,
+and reverting restores 539/553. The cause is **unknown**, and settling it needs a
+line-symbolized or ASan build — the insertion into `opToSplitInfoMap` while iterating
+(`AIRMiscPasses.cpp:3315-3329`) is a *candidate*, not a finding.
+
+The consequence for the port holds regardless of mechanism: **option (1) cannot proceed until that
+crash is understood**, because it requires exactly the change that triggers it. Reverted; no code
+proposed.
 
 Both asserts are reproducible in seconds against the committed input above, so a candidate can be
 checked before it is believed — that is how `971bab2a`, "keep the counts", and "canonicalize at the
