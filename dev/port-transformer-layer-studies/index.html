@@ -1288,6 +1288,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#q15-fa-sliding-window-checked-2026-09-06-closes-with-no-pr" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Q15 (FA sliding window) — checked 2026-09-06, closes with no PR
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#next-slice-the-lm-head-idle-row-family-risk-measured-2026-09-05-against-460aadcc" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1512,6 +1523,49 @@ past the plan's base:</p>
 </tbody>
 </table>
 <p><strong>1,505 lines closed.</strong> E's Remaining moves 8,888 → 7,383 and the total 14,855 → 13,350.</p>
+<h2 id="q15-fa-sliding-window-checked-2026-09-06-closes-with-no-pr">Q15 (FA sliding window) — checked 2026-09-06, closes with no PR<a class="headerlink" href="#q15-fa-sliding-window-checked-2026-09-06-closes-with-no-pr" title="Permanent link">&para;</a></h2>
+<p>The split plan pre-approved porting the tag's three window lits <strong>if</strong> the check showed main's
+semantics matched the tag's but the coverage was missing. The check was run, and the condition
+is <strong>not met</strong>: the two implement the window by different mechanisms.</p>
+<ul>
+<li>The tag bands at COMPILE TIME -- a <code>-DWINDOW_LEN</code> on the hand-written <code>attn_npu2.cc</code>. Its
+  negative control (53 lines) rebuilds that object with <code>EXTRA_KERNEL_FLAGS="-DWINDOW_LEN=0"</code>
+  and requires the banded reference to reject it.</li>
+<li>Main bands in the GENERATED MLIR: <code>--window</code> emits an <code>apply_window_mask</code> extern call and
+  skips whole KV blocks outside the band (<code>attn_npu2.py:186</code>, <code>:412</code>). There is no
+  <code>WINDOW_LEN</code> define to switch off, so the tag's control has no counterpart here and porting
+  it would test nothing.</li>
+</ul>
+<p>The concern behind that control -- a window flag that is silently ignored, where full causal is
+a superset and still looks plausible -- is answered on main by construction, and measured rather
+than argued. Same shape, <code>--causal</code> with and without <code>--window 512</code>, module text only:</p>
+<table>
+<thead>
+<tr>
+<th>arm</th>
+<th style="text-align: right;">lines</th>
+<th style="text-align: right;"><code>apply_window_mask</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--causal</code></td>
+<td style="text-align: right;">810</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td><code>--causal --window 512</code></td>
+<td style="text-align: right;">811</td>
+<td style="text-align: right;">2</td>
+</tr>
+</tbody>
+</table>
+<p>The flag demonstrably reaches the device program, and <code>run_npu2_makefile_peano_causal_window512.lit</code>
+(landed in #31) checks the result against a banded reference. <strong>Recommendation: port nothing for
+W1.</strong> The remaining tag lit, <code>run_npu2_makefile_peano_causal_rect.lit</code> (18 lines), belongs to H1b
+(rectangular <code>kv_len</code>), which the plan defers for want of a consumer on main.</p>
+<p>What is NOT claimed: that main's mask is numerically equivalent to the tag's banding. That is the
+window512 lit's job, on device, and it is already on main.</p>
 <p>One row from the plan is <strong>not</strong> closed and not counted: <code>matvec_int4_packed_add.py</code> (+3). The
 file lives at <code>matrix_vector_multiplication/int4_awq/</code> on <strong>both</strong> main and the tag, and the +3 is
 a <code>BoolAttr</code> import plus two <code>l1_part_op.attributes["air.shrinkage"] = BoolAttr.get(False)</code>
