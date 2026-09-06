@@ -221,8 +221,24 @@ stay consistent — substitute, then canonicalise the map *and* its operands tog
 in one step. That needs the operand vector threaded into the compose lambda, which today returns a
 map alone; it is a real change, not a one-liner, and it is the next slice.
 
+**Attempted 2026-09-05, and it narrowed again rather than fixing:**
+
+| attempt | result |
+|---|---|
+| keep the map's own counts in `replace` | clears assert 1; pass runs **32** map constructions further, then assert 2 |
+| + `canonicalizeMapAndOperands` before building the apply | **its own precondition asserts** — it requires `map.getNumInputs() == operands.size()`, which does not hold at every call |
+| guard that call, then print both counts at the create site | **every one of 16 constructions has `numInputs == operands.size()`** — e.g. `()[s0] -> (s0 * 16 + 12)`, 1 input, 1 operand |
+
+**That last row is the useful one, and it overturns the obvious reading of assert 2.** The rebuilt
+`affine.apply` is *not* created with a mismatched operand list — the mismatch appears **downstream**
+of construction, when something later folds a map against a different input count. So the fix is
+not at `AffineApplyOp::create`, and the next session should start by finding which consumer of the
+rewritten apply (or which reuse of `map` after it) sees the inconsistent pair.
+
 Both asserts are reproducible in seconds against the committed input above, so a candidate can be
-checked before it is believed.
+checked before it is believed — that is how `971bab2a`, "keep the counts", and now "canonicalize at
+the create site" were each eliminated. No compiler change is proposed from any of them; the tree is
+clean.
 Any plan that schedules the LM-head family as an E-side slice hits this abort on its first device
 run.
 
