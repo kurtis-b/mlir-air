@@ -60,6 +60,37 @@ past the plan's base:
 
 **1,505 lines closed.** E's Remaining moves 8,888 → 7,383 and the total 14,855 → 13,350.
 
+## Q15 (FA sliding window) — checked 2026-09-06, closes with no PR
+
+The split plan pre-approved porting the tag's three window lits **if** the check showed main's
+semantics matched the tag's but the coverage was missing. The check was run, and the condition
+is **not met**: the two implement the window by different mechanisms.
+
+* The tag bands at COMPILE TIME -- a `-DWINDOW_LEN` on the hand-written `attn_npu2.cc`. Its
+  negative control (53 lines) rebuilds that object with `EXTRA_KERNEL_FLAGS="-DWINDOW_LEN=0"`
+  and requires the banded reference to reject it.
+* Main bands in the GENERATED MLIR: `--window` emits an `apply_window_mask` extern call and
+  skips whole KV blocks outside the band (`attn_npu2.py:186`, `:412`). There is no
+  `WINDOW_LEN` define to switch off, so the tag's control has no counterpart here and porting
+  it would test nothing.
+
+The concern behind that control -- a window flag that is silently ignored, where full causal is
+a superset and still looks plausible -- is answered on main by construction, and measured rather
+than argued. Same shape, `--causal` with and without `--window 512`, module text only:
+
+| arm | lines | `apply_window_mask` |
+|---|---:|---:|
+| `--causal` | 810 | 0 |
+| `--causal --window 512` | 811 | 2 |
+
+The flag demonstrably reaches the device program, and `run_npu2_makefile_peano_causal_window512.lit`
+(landed in #31) checks the result against a banded reference. **Recommendation: port nothing for
+W1.** The remaining tag lit, `run_npu2_makefile_peano_causal_rect.lit` (18 lines), belongs to H1b
+(rectangular `kv_len`), which the plan defers for want of a consumer on main.
+
+What is NOT claimed: that main's mask is numerically equivalent to the tag's banding. That is the
+window512 lit's job, on device, and it is already on main.
+
 One row from the plan is **not** closed and not counted: `matvec_int4_packed_add.py` (+3). The
 file lives at `matrix_vector_multiplication/int4_awq/` on **both** main and the tag, and the +3 is
 a `BoolAttr` import plus two `l1_part_op.attributes["air.shrinkage"] = BoolAttr.get(False)`
