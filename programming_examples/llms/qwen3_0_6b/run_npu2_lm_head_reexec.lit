@@ -25,6 +25,12 @@
 // judge must reject. Without it a clean verdict would only mean the judge
 // never says WRONG.
 //
+// The gate holds the NPU across d1-d7 (`KernelCache.hold_device()`). It has
+// to: `load_and_run` otherwise releases the lock between dispatches, and
+// under this suite's default parallelism another NPU test's ELF could land in
+// a gap -- which is precisely what heals the stale state, so an interleaved
+// run would turn a real failure clean.
+//
 // No HF weights: random weights against an f32 reference. NPU serialization
 // lives one layer down (KernelCache takes /tmp/npu.lock).
 //
@@ -35,6 +41,7 @@
 // RUN: make -f %S/Makefile check-lm-head-reexec PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
 //
 // CHECK: [reexec] c0 CONTROL (deliberately corrupted): WRONG
+// CHECK: [reexec] holding the NPU across d1-d7
 // CHECK: [reexec] d1 first dispatch: clean
 // CHECK: [reexec] d2 back-to-back: clean
 // CHECK: [reexec] d3 back-to-back: clean

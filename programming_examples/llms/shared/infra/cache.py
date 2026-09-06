@@ -348,6 +348,43 @@ class KernelCache:
         # allocating its own — collapses the prefill activation-scratch
         # footprint from N_layers copies to 1.
         self._shared_bos = {}
+        # ONE lock object for the whole cache, rather than a fresh
+        # filelock.FileLock at each use. filelock is re-entrant per INSTANCE
+        # (it counts acquisitions), so sharing one instance is what lets
+        # `hold_device()` bracket a sequence of dispatches while the
+        # per-dispatch acquisitions below still work unchanged. Two separate
+        # instances on the same path would instead block each other.
+        # Created on first use, not here: `filelock` is imported alongside the
+        # device-only dependencies so that constructing a KernelCache stays
+        # possible without them.
+        self._npu_lock = None
+
+    def _device_lock(self):
+        if self._npu_lock is None:
+            import filelock
+
+            self._npu_lock = filelock.FileLock("/tmp/npu.lock")
+        return self._npu_lock
+
+    @contextlib.contextmanager
+    def hold_device(self):
+        """Hold the NPU across several dispatches, not just within each one.
+
+        `load_and_run` normally takes and releases the lock per call, which is
+        right for inference: it lets other work interleave between kernels.
+        A test whose SUBJECT is what happens between dispatches needs the
+        opposite -- notably the LM-head re-execution gate, where another ELF
+        running in the gap is exactly what heals the stale state it is trying
+        to observe, so an interleaved test would turn a real failure clean.
+
+        Re-entrant, so the per-dispatch acquisitions inside simply nest. Use
+        this rather than an outer `flock` on the same file: that is a second
+        open file description and would block against this one, and a bare
+        flock nested inside a devq job would wait on its own parent
+        (AGENTS.md).
+        """
+        with self._device_lock():
+            yield
 
     def _log(self, msg):
         if self.verbose:
@@ -631,7 +668,7 @@ class KernelCache:
         if name not in self._loaded:
             artifact = self.artifacts[name]
             backend = XRTBackend(**backend_kwargs)
-            with filelock.FileLock("/tmp/npu.lock"):
+            with self._device_lock():
                 invoker = backend.load(artifact)
             self._loaded[name] = (backend, invoker)
             self._log(f"Loaded {name} (XRT context cached)")
@@ -688,7 +725,7 @@ class KernelCache:
         # Static inputs (e.g. weights) are written on first call only,
         # then skipped on subsequent calls since BO data is unchanged.
         t0 = time.time()
-        with filelock.FileLock("/tmp/npu.lock"):
+        with self._device_lock():
             # Phase 1: Write inputs using bo.map() (zero-copy into BO memory)
             t_write = time.perf_counter()
             n_written = 0

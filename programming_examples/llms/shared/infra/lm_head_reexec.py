@@ -123,25 +123,37 @@ def run_gate(
         return 2
 
     v = []
-    d1 = run_head(xs[0])
-    v.append(judge("d1 first dispatch", d1, refs[0], None))
-    d2 = run_head(xs[0])
-    v.append(judge("d2 back-to-back", d2, refs[0], d1))
-    d3 = run_head(xs[0])
-    v.append(judge("d3 back-to-back", d3, refs[0], d1))
-    print(
-        f"[reexec] d2 vs d3 max abs diff {np.max(np.abs(d2 - d3)):.3e} (non-zero = non-deterministic)"
-    )
-    time.sleep(0.5)
-    d4 = run_head(xs[0])
-    v.append(judge("d4 after 0.5 s idle", d4, refs[0], d1))
-    d5 = run_head(xs[1])
-    v.append(judge("d5 new input back-to-back", d5, refs[1], None))
-    run_other(xs[0])
-    d6 = run_head(xs[0])
-    v.append(judge("d6 after other ELF", d6, refs[0], d1))
-    d7 = run_head(xs[0])
-    v.append(judge("d7 back-to-back after d6", d7, refs[0], d1))
+    # ADJACENCY IS THE SUBJECT, so the device must stay ours for the whole
+    # sequence. `load_and_run` takes and releases the NPU lock per dispatch,
+    # which is right for inference but wrong here: another test's ELF landing
+    # in a gap is EXACTLY what heals the stale state this gate exists to
+    # observe, so an interleaved run would turn a real failure clean and
+    # false-pass. `hold_device()` is re-entrant, so the per-dispatch
+    # acquisitions inside simply nest -- do not wrap this in a bare `flock` on
+    # the same file instead (a second open file description would block
+    # against the inner one, and a bare flock nested inside a devq job waits
+    # on its own parent, AGENTS.md).
+    with cache.hold_device():
+        print("[reexec] holding the NPU across d1-d7", flush=True)
+        d1 = run_head(xs[0])
+        v.append(judge("d1 first dispatch", d1, refs[0], None))
+        d2 = run_head(xs[0])
+        v.append(judge("d2 back-to-back", d2, refs[0], d1))
+        d3 = run_head(xs[0])
+        v.append(judge("d3 back-to-back", d3, refs[0], d1))
+        print(
+            f"[reexec] d2 vs d3 max abs diff {np.max(np.abs(d2 - d3)):.3e} (non-zero = non-deterministic)"
+        )
+        time.sleep(0.5)
+        d4 = run_head(xs[0])
+        v.append(judge("d4 after 0.5 s idle", d4, refs[0], d1))
+        d5 = run_head(xs[1])
+        v.append(judge("d5 new input back-to-back", d5, refs[1], None))
+        run_other(xs[0])
+        d6 = run_head(xs[0])
+        v.append(judge("d6 after other ELF", d6, refs[0], d1))
+        d7 = run_head(xs[0])
+        v.append(judge("d7 back-to-back after d6", d7, refs[0], d1))
     ok = sum(v)
     print(f"[reexec] {ok}/{len(v)} dispatches clean")
     print("[reexec] PASS" if ok == len(v) else "[reexec] FAIL")

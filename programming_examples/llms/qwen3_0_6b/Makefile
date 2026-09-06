@@ -126,7 +126,7 @@ diagnosis:
 ## LM-head ELF back-to-back re-execution gate (no HF weights)
 check-lm-head-reexec:
 	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && python3 $(srcdir)/lm_head_reexec_gate.py lm_head_reexec_cache
+	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/lm_head_reexec_gate.py lm_head_reexec_cache
 
 ## Remove all build artifacts and verify reports
 clean:
