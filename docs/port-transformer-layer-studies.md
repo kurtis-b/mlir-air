@@ -322,6 +322,32 @@ suite catches over-refusal. Suite **539 passed / 553, 0 failures** (baseline 538
 **The 2-row herd is still blocked** — this changes an abort into an explanation, nothing more.
 Options (1) and (2) remain the actual fix.
 
+**Option (1) attempted 2026-09-05, and it uncovered a second, independent defect.** The structural
+half alone — widen `infoEntryTy` to `<split_dim, split_affine_map, split_affine_map_operands,
+split_offset, split_size, split_stride>`, populate the operands at the producer, read them
+**nowhere** — should be behaviour-neutral. It is not:
+
+```
+FAIL: Transform/AIRMiscPasses/air_split_l2_memref.mlir
+  #3 __memcpy_avx512_unaligned_erms
+  #4 llvm::SmallVectorImpl<mlir::Value>::operator=(...)
+  #5 xilinx::AIRSplitL2MemrefForBufferConstraintPass::runOnOperation()
+```
+
+A **segfault**, on an existing test, from adding a field nothing reads. Suite 538/553 with the
+change, back to **539/553 with it reverted**, so it is unambiguously the change.
+
+What that means: `infoEntryTy` was all-POD and therefore trivially copyable, and something in the
+pass copies or assigns an entry whose backing storage is no longer valid — a dangling reference
+into a container that reallocated, most likely, which a trivially-copyable tuple survives by
+accident and a heap-allocating member does not. **That is a latent lifetime bug in the pass,
+independent of the multi-symbol problem**, and it is now the first thing option (1) has to fix:
+carrying the operands is impossible until an `infoEntryTy` copy is safe.
+
+Notably, the existing test that segfaults is the *single*-symbol one — so this defect has nothing
+to do with 2-row herds and would bite any change that puts a non-trivial member in that tuple.
+Reverted; no code proposed.
+
 Both asserts are reproducible in seconds against the committed input above, so a candidate can be
 checked before it is believed — that is how `971bab2a`, "keep the counts", and "canonicalize at the
 create site" were each eliminated. No compiler change is proposed from any of them; the tree is
