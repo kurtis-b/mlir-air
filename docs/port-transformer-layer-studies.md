@@ -151,13 +151,42 @@ test).
 
 1. **It does not explain the `HERD_ROWS=2` crash.** That is a different shape — this test never
    asserted on main. The host-only reproducer above remains open and unexplained.
-2. **Main is still missing `971bab2a`'s operand-ordering guarantee.** Its `air::ExecuteOp` branch
+2. **`971bab2a`'s operand-ordering fix is now TESTED and ELIMINATED** (2026-09-05). Main is still
+   missing that guarantee — Its `air::ExecuteOp` branch
    builds `originalApplyOperands` from `getUsedValuesDefinedAbove`, an unordered set, while the
    replacement map reuses the apply's expression verbatim — so symbol *i* need not bind to operand
-   *i*. `mapForExpr` (#1934) removed the assert that used to hide this. I applied `971bab2a`'s fix
-   for it, found it changed **nothing observable** on this test, and **reverted it**: an unverified
-   compiler change with no failing test behind it is not something to land. It is a real candidate
-   for whatever reproduces the `HERD_ROWS=2` shape.
+   *i*. `mapForExpr` (#1934) removed the assert that used to hide it — but applying that
+   fix and running the minimal reproducer below shows it **still aborts**. So it is not the fix for
+   this shape, and it is reverted. The guarantee may still be worth restoring on its own merits;
+   it is no longer a candidate explanation for this crash.
+
+### The `HERD_ROWS=2` crash: minimal reproducer, and what it is not
+
+**Control first — this is current main, not a stale install.** The crash was first seen through
+`install-main/bin/aircc`, dated **Aug 30**. Replaying the *exact* argv (captured with `--verbose`)
+against `build-xrt/bin/aircc`, which contains everything on main, reproduces the identical
+assertion. Only two commits have touched `mlir/` since Aug 30 and both are #66's behaviour-
+preserving refactor. Method note: an earlier replay with *guessed* flags produced a different error
+(`'air.dma_memcpy_nd' op failed to get buffer`) — capture the argv, do not reconstruct it.
+
+**Minimal reproducer — host-only, one second, and committed** so it can actually be run:
+
+```sh
+air-opt mlir/test/Transform/AIRMiscPasses/Inputs/split_l2_herd_rows2_pre_split.mlir \
+  --air-split-l2-memref="max-launch-channels-mm2s=16 max-launch-channels-s2mm=16 tiles-per-l2-tile=4"
+#  -> Assertion `willBeValidAffineMap(...)' failed.
+#     AIRSplitL2MemrefForBufferConstraintPass -> tileChannelOpByFactor
+```
+
+The input is **143 lines** and lives under `Inputs/`, which `mlir/test/lit.cfg.py:93` excludes from
+the testsuite — it has to, since running the pass on it aborts `air-opt`. Its header records where
+it came from: aircc's own 24-pass prefix (printed by `aircc -v`) applied to the matvec GEMV example
+built with a 2-row herd on `feat/matvec-herd-rows`, and the pass options are the ones aircc uses at
+that stage. Nothing here needs the NPU, so this is a compiler-debugging loop of seconds — and any
+candidate fix can be checked against it by anyone, which is how `971bab2a` was eliminated above.
+
+**What it is not**: the same shape as the `multi_symbol_offset` lit (which passes on main, ported
+in #82), and not fixed by `971bab2a`.
 Any plan that schedules the LM-head family as an E-side slice hits this abort on its first device
 run.
 
