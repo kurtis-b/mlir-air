@@ -235,9 +235,27 @@ of construction, when something later folds a map against a different input coun
 not at `AffineApplyOp::create`, and the next session should start by finding which consumer of the
 rewritten apply (or which reuse of `map` after it) sees the inconsistent pair.
 
+**Where assert 2 actually comes from (2026-09-05, backtrace + three probes):**
+
+The frames name it — `AffineApplyOp::fold` → `AffineMap::constantFold` → `partialConstantFold`.
+So this is **MLIR folding an `affine.apply` that already exists in the IR** with map inputs ≠
+operand count. It is not a bad `create` call; it is a malformed op reaching the folder. Three
+probes then bound where it can come from:
+
+| probe | result |
+|---|---|
+| is the committed input itself malformed? | **no** — it parses, `--verify-roundtrip`s and `--canonicalize`s clean (exit 0) |
+| does the pass's own `AffineApplyOp::create` build one? | **no** — the pass has exactly one such call, and all **16** constructions print `numInputs == operands.size()` |
+| do the `Util.cpp` offset-producer sites (1496, 1527) build one? | **not by inspection** — `composedMap` is built with `originalMap.getNumDims(), getNumSymbols()` and fed `affine_apply.getOperands()`, consistent by construction |
+
+So a malformed apply is produced **during** the pass, by neither of the two obvious constructors.
+The next step is to catch it at birth rather than reason about it: attach a rewriter listener (or a
+temporary check after each rewrite step in `tileChannelOpByFactor`) that verifies every
+`affine.apply` in the module, and report the first step that introduces the inconsistency.
+
 Both asserts are reproducible in seconds against the committed input above, so a candidate can be
-checked before it is believed — that is how `971bab2a`, "keep the counts", and now "canonicalize at
-the create site" were each eliminated. No compiler change is proposed from any of them; the tree is
+checked before it is believed — that is how `971bab2a`, "keep the counts", and "canonicalize at the
+create site" were each eliminated. No compiler change is proposed from any of them; the tree is
 clean.
 Any plan that schedules the LM-head family as an E-side slice hits this abort on its first device
 run.
