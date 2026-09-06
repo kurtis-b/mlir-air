@@ -1699,9 +1699,29 @@ FailureOr<Value> tileChannelOpByFactor(
           if (affineMap) {
             auto original_map = affineMap;
             if (original_map.getNumSymbols() > 0) {
-              original_map = original_map.replace(
-                  getAffineSymbolExpr(0, ctx),
-                  getAffineConstantExpr(const_in, ctx), 0, 1);
+              // Substitute EVERY symbol, not just s0. The stored map describes
+              // where one *producer* of this memref reads or writes; s0 carries
+              // the split offset, but a producer inside a multi-level loop nest
+              // over the split dimension (a herd with more than one row) leaves
+              // further symbols naming that nest's induction variables. The op
+              // being split here moves the whole extent of that nest in one
+              // transfer, so each such symbol contributes its base -- 0 -- and
+              // the constant that survives is the slab offset.
+              //
+              // Binding only s0 left s1.. unbound: the composition below then
+              // built `()[s0, s1] -> ...` while supplying a single operand, an
+              // invalid map that aborted the compiler inside AffineMap::get.
+              // Where the map has exactly one symbol this is the substitution
+              // that was already performed, so no working case changes.
+              SmallVector<AffineExpr> symReplacements;
+              for (unsigned s = 0; s < original_map.getNumSymbols(); s++)
+                symReplacements.push_back(
+                    getAffineConstantExpr(s == 0 ? const_in : 0, ctx));
+              original_map = AffineMap::get(
+                  original_map.getNumDims(), 0,
+                  original_map.getResult(0).replaceDimsAndSymbols(
+                      {}, symReplacements),
+                  ctx);
             } else if (original_map.getNumDims() > 0) {
               original_map = original_map.replace(
                   getAffineDimExpr(0, ctx),
@@ -1720,31 +1740,6 @@ FailureOr<Value> tileChannelOpByFactor(
           originalExpr + i * llvm::divideCeilSigned(originalMemrefSize, factor);
       return mapForExpr(add);
     };
-
-    // A stored split map with more than one symbol cannot be composed here.
-    // `infoEntryTy` keeps the map but NOT the operands of the apply it came
-    // from (see where it is built, `applyMap = apply.getAffineMap()`), which is
-    // only sound while the map has a single symbol: substituting s0 with the
-    // split offset then leaves a constant. With two symbols the substitution
-    // leaves s1 bound to an operand nobody carried, and the composition below
-    // would build `()[s0, s1] -> ...` while supplying one operand -- an invalid
-    // map that aborts the compiler inside AffineMap::get, or later inside
-    // AffineApplyOp::fold. Refuse it with a diagnostic instead: an assert is
-    // not an answer to unsupported input, and the caller already turns failure
-    // into a clean signalPassFailure().
-    if (splitInfoAffineMap && splitInfoAffineMap.getNumSymbols() > 1) {
-      std::string mapStr;
-      llvm::raw_string_ostream mapOs(mapStr);
-      splitInfoAffineMap.print(mapOs);
-      originalChanOp->emitOpError()
-          << "air-split-l2-memref cannot split this access: its offset map "
-          << mapStr << " has " << splitInfoAffineMap.getNumSymbols()
-          << " symbols, and only one is supported (the split-info entry stores "
-             "the map without the operands that would bind the rest). This "
-             "shape comes from a multi-level loop nest over the split "
-             "dimension, e.g. a herd with more than one row.";
-      return failure();
-    }
 
     AffineMap map;
     if (splitInfoAffineMap || splitInfoSplitSize ||
@@ -2058,13 +2053,27 @@ void AIRSplitL2MemrefForBufferConstraintPass::partitionMemref(
           return;
         }
         // Any const operands to affine map should have been canonicalized
-        // away.
+        // away, because the rewrite below edits the map's expression and
+        // cannot account for a constant hiding in the operand list. Fold them
+        // in here rather than refusing: an apply built while splitting a
+        // multi-row herd is correct when created and only acquires a constant
+        // operand afterwards, when that herd is unrolled, so there is no
+        // earlier point at which this could have been canonicalized.
         if (llvm::any_of(apply->getOperands(), [](Value oper) {
               return getConstantIntValue(oper);
             })) {
-          defOp->emitOpError("found constant operands to affine map, which "
-                             "aren't canonicalized away.");
-          return;
+          AffineMap foldedMap = apply.getMap();
+          SmallVector<Value> foldedOperands(apply->getOperands());
+          affine::canonicalizeMapAndOperands(&foldedMap, &foldedOperands);
+          if (llvm::any_of(foldedOperands, [](Value oper) {
+                return getConstantIntValue(oper);
+              })) {
+            defOp->emitOpError("found constant operands to affine map, which "
+                               "aren't canonicalized away.");
+            return;
+          }
+          apply.setMap(foldedMap);
+          apply->setOperands(foldedOperands);
         }
         // Set map's expressions to cancel out each key's offset
         auto applyExpr = apply.getMap().getResult(0);
