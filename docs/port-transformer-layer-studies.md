@@ -105,11 +105,23 @@ F-cluster prerequisite** — and it is a *specific* one, not "somewhere in F's 5
 - and **the tag's regression test for that case is absent from main** (`git ls-files` finds it on
   the tag, not on main), so nothing pins the multi-symbol-offset shape either way.
 
-**Tested 2026-09-05, and that plan was wrong: main's `air-opt` PASSES the tag's test.**
-`air_split_l2_memref_multi_symbol_offset.mlir` run against `build-xrt/bin/air-opt` with the pass
-options from its own RUN line exits **0** — so `48225ba5` (#1934) genuinely does cover the
-multi-symbol-offset shape that test pins, and 4a's SUPERSEDED classification is confirmed correct.
-Porting it would add a passing test, not a failing one.
+**Tested 2026-09-05 with the test's COMPLETE RUN line — the tag's test FAILS on main, so the
+prerequisite stands.** Two runs, because the first measured only half the gate:
+
+| what was run | result |
+|---|---|
+| `air-opt … --air-split-l2-memref=…` alone | **exit 0** — main does *not* assert on this input |
+| the test's actual RUN line, `air-opt … \| FileCheck %s` | **exit 1**: `multi_symbol_offset.mlir:198: error: CHECK: expected string not found` |
+
+So `48225ba5` (#1934) changed the *failure mode* without preserving the *behaviour the tag pinned*:
+main stopped asserting on the multi-symbol offset, and now emits a different channel put than the
+test requires — line 198 wants `air.channel.put …[%c0, %[[Q0]], %c0, …]` and main produces an extra
+`affine.apply #map3()[%arg3, %arg5]` feeding a different operand list. **That is a real, observable
+delta, not a supersession**, so 4a's SUPERSEDED classification for `971bab2a` is at best partial.
+
+Method worth recording with the result: **exit 0 from the producer is not a passing test when the
+RUN line pipes into FileCheck.** Reading the producer's exit code and skipping every output
+assertion is the same "half a gate" error this ledger has already paid for.
 
 The crash is therefore a **different** shape from the one the tag fixed, and finding it is the
 work. What is established:
@@ -122,9 +134,10 @@ work. What is established:
   so the offending map is produced by the aircc pipeline's earlier passes, not by the emitted IR
   as written.
 
-Next step, unchanged in goal but now correctly aimed: capture the module as it enters
-`air-split-l2-memref` inside the aircc pipeline, minimise it, and fix `tileChannelOpByFactor` for
-that shape — with the tag's test kept as the existing-behaviour control it turns out to be.
+Next step: port `air_split_l2_memref_multi_symbol_offset.mlir` as the failing case it is (CHECK
+line 198), decide whether `971bab2a`'s form is the right fix on top of #1934 or whether the test's
+expectations should move, and only then return to `HERD_ROWS=2`. The host-only reproducer above
+stays the end-to-end check; the lit is the narrow one.
 Any plan that schedules the LM-head family as an E-side slice hits this abort on its first device
 run.
 
