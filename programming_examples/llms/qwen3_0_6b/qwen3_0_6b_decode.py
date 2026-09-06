@@ -90,7 +90,7 @@ def required_decode_artifacts():
     `_O_FFN_KERNEL` the compile and dispatch paths use, so the check below
     can never drift from what `compile_decode_kernels` writes.
     """
-    return (_RMS_QKV_KERNEL, _O_FFN_KERNEL, "lm_head_gemv")
+    return (_RMS_QKV_KERNEL, _O_FFN_KERNEL, _LM_KERNEL)
 
 
 def require_decode_artifacts(cache):
@@ -267,6 +267,17 @@ _LM_N_PARTITIONS = len(_LM_PARTS)
 # it as the equal-split shorthand; `_LM_PARTS` is what actually decides the
 # partitioning now.
 _LM_N_PART = _LM_PARTS[0]
+
+# The cache artifact key is versioned with the partitioning, exactly as
+# `_RMS_QKV_KERNEL` is versioned with its launch count and for the same
+# reason: the host ABI is 1 + 2 * len(_LM_PARTS) buffers, so a decode cache
+# compiled before this change holds a 39-argument ELF while the caller now
+# passes 21. `load_manifest()` would accept it -- same toolchain, same key --
+# and the mismatch surfaces on the device, not at load. A distinct key makes a
+# stale cache a clean "recompile" error from `require_decode_artifacts`
+# instead. The ELF's own instance_name stays `lm_head_gemv`: it must match the
+# func the builder emits.
+_LM_KERNEL = f"lm_head_gemv_p{len(_LM_PARTS)}"
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +591,7 @@ def compile_decode_kernels(cache, config, verbose=False):
 
     print("\n--- lm_head_gemv (9 x 16384 + 4480, vocab 151936) ---")
     cache.compile_and_cache(
-        "lm_head_gemv",
+        _LM_KERNEL,
         build_lm_head_gemv_qwen_module(emb_dim),
         _lm_gemv_backend(verbose),
     )

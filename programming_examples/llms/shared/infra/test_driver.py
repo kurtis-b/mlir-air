@@ -738,6 +738,27 @@ def test_run_lm_head_truncates_the_last_partition_to_vocab_size():
     assert list(out) == [1.0, 2.0, 3.0], out
 
 
+# What each model's `_run_lm_head` must pass, exactly. `None` is the default
+# for the models whose vocabulary divides evenly into equal partitions.
+# Qwen3-0.6B is 9 x 16384 + 4480, so it MUST bind both the partition list and
+# the ABI-versioned artifact key -- omitting either is a device-level bug, not
+# a style choice, so neither is optional here.
+_LM_SHIM_EXPECTED = {
+    None: {
+        "lm_gemv_backend": "_lm_gemv_backend",
+        "n_partitions": "_LM_N_PARTITIONS",
+        "n_part": "_LM_N_PART",
+    },
+    "qwen3_0_6b": {
+        "lm_gemv_backend": "_lm_gemv_backend",
+        "n_partitions": "_LM_N_PARTITIONS",
+        "n_part": "_LM_N_PART",
+        "parts": "_LM_PARTS",
+        "kernel_name": "_LM_KERNEL",
+    },
+}
+
+
 def test_each_shim_binds_its_own_lm_head_partitioning():
     for m in LM_MODELS:
         tree = ast.parse((_LLMS / m / f"{m}_inference.py").read_text())
@@ -749,20 +770,13 @@ def test_each_shim_binds_its_own_lm_head_partitioning():
         assert len(fn) == 1, m
         call = [n for n in ast.walk(fn[0]) if isinstance(n, ast.Call)][0]
         kw = {k.arg: getattr(k.value, "id", None) for k in call.keywords}
-        required = {
-            "lm_gemv_backend": "_lm_gemv_backend",
-            "n_partitions": "_LM_N_PARTITIONS",
-            "n_part": "_LM_N_PART",
-        }
-        # `parts` is optional -- only a model whose vocabulary does not divide
-        # evenly needs it -- but if present it must be the decode module's
-        # `_LM_PARTS` and nothing else, so this stays an audit rather than
-        # becoming "any kwargs allowed".
-        extra = set(kw) - set(required)
-        assert extra <= {"parts"}, (m, sorted(extra))
-        if "parts" in kw:
-            required["parts"] = "_LM_PARTS"
-        assert kw == required, (m, kw)
+        # PER MODEL, and exact. Making `parts` merely optional would be a
+        # weakening: dropping `parts=_LM_PARTS` from Qwen3-0.6B's shim would
+        # still pass, and `run_lm_head` would then build ten 16384-row outputs
+        # against a 9x16384+4480 ELF and corrupt the tail. Qwen3-0.6B must
+        # bind it; every other model must not have it at all.
+        required = dict(_LM_SHIM_EXPECTED.get(m, _LM_SHIM_EXPECTED[None]))
+        assert kw == required, (m, kw, required)
         handles = list(required.values())
         origin = {}
         for n in ast.walk(tree):

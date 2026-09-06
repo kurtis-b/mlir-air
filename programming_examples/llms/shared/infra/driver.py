@@ -501,12 +501,18 @@ def run_lm_head(
     n_partitions,
     n_part,
     parts=None,
+    kernel_name="lm_head_gemv",
 ):
     """The partitioned NPU LM-head GEMV.
 
     `n_partitions`/`n_part` are this model's vocabulary split (`_LM_N_PARTITIONS`
     and `_LM_N_PART`) and `lm_gemv_backend` its backend selector — all three live
     in `<model>_decode`, which is why they are injected rather than imported.
+
+    `kernel_name` is the cache artifact key. It defaults to the historical
+    `lm_head_gemv`; a model whose host ABI has changed versions the key (as
+    `_RMS_QKV_KERNEL` does) so a stale cache cannot bind one ABI to the
+    other's ELF.
 
     `parts` overrides the equal split with an explicit list of partition row
     counts, matching `build_lm_head_gemv_module`'s argument of the same name. A
@@ -527,7 +533,7 @@ def run_lm_head(
         lm_inputs.append(np.zeros(rows, dtype=bfloat16))
         out_idx.append(2 + 2 * p)
     res = decode_cache.load_and_run(
-        "lm_head_gemv",
+        kernel_name,
         lm_gemv_backend(),
         *lm_inputs,
         output_indices=out_idx,

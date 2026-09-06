@@ -55,6 +55,7 @@ from qwen3_0_6b_decode import (
     _LM_N_PARTITIONS,
     _LM_N_PART,
     _LM_PARTS,
+    _LM_KERNEL,
     _W4_DECODE,
     require_decode_artifacts,
     _run_o_gemv_ffn_int4,
@@ -194,6 +195,7 @@ def _run_lm_head(decode_cache, weights, x_normed_bf16, vocab_size):
         n_partitions=_LM_N_PARTITIONS,
         n_part=_LM_N_PART,
         parts=_LM_PARTS,
+        kernel_name=_LM_KERNEL,
     )
 
 
@@ -305,7 +307,7 @@ def _preload_decode_weights(decode_cache, weights, config):
         lm_inputs.append(weights._lm_weight_parts_gemv[p])
         lm_inputs.append(np.zeros(_LM_N_PART, dtype=bfloat16))
     decode_cache.load_and_run(
-        "lm_head_gemv",
+        _LM_KERNEL,
         _lm_gemv_backend(),
         *lm_inputs,
         output_indices=[2 + 2 * p for p in range(_LM_N_PARTITIONS)],
@@ -319,7 +321,7 @@ def _preload_decode_weights(decode_cache, weights, config):
 
 
 # ---------------------------------------------------------------------------
-# NPU LM-head (19-partition GEMV) — shared by prefill end + decode.
+# NPU LM-head (9 x 16384 + 4480 GEMV) — shared by prefill end + decode.
 # ---------------------------------------------------------------------------
 
 
