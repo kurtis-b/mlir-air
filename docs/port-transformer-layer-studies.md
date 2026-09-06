@@ -105,9 +105,26 @@ F-cluster prerequisite** — and it is a *specific* one, not "somewhere in F's 5
 - and **the tag's regression test for that case is absent from main** (`git ls-files` finds it on
   the tag, not on main), so nothing pins the multi-symbol-offset shape either way.
 
-The concrete F row to take before LM-head is therefore: port the tag's
-`air_split_l2_memref_multi_symbol_offset.mlir` as a failing case, establish whether `971bab2a`'s
-form handles the input `HERD_ROWS=2` produces where `48225ba5`'s does not, and fix from there.
+**Tested 2026-09-05, and that plan was wrong: main's `air-opt` PASSES the tag's test.**
+`air_split_l2_memref_multi_symbol_offset.mlir` run against `build-xrt/bin/air-opt` with the pass
+options from its own RUN line exits **0** — so `48225ba5` (#1934) genuinely does cover the
+multi-symbol-offset shape that test pins, and 4a's SUPERSEDED classification is confirmed correct.
+Porting it would add a passing test, not a failing one.
+
+The crash is therefore a **different** shape from the one the tag fixed, and finding it is the
+work. What is established:
+
+- **The reproducer is host-only — no device, no devq**, which is much cheaper than how it was
+  first found: on `feat/matvec-herd-rows`,
+  `python3 matvec.py --compile-mode compile-and-xclbin --m 2048 --k 8192 --tile-m 2 --m-input 1
+  --herd-m 4 --herd-rows 2` aborts with the same assertion.
+- Running `--air-split-l2-memref` **alone** on the builder's own output does *not* crash (exit 0),
+  so the offending map is produced by the aircc pipeline's earlier passes, not by the emitted IR
+  as written.
+
+Next step, unchanged in goal but now correctly aimed: capture the module as it enters
+`air-split-l2-memref` inside the aircc pipeline, minimise it, and fix `tileChannelOpByFactor` for
+that shape — with the tag's test kept as the existing-behaviour control it turns out to be.
 Any plan that schedules the LM-head family as an E-side slice hits this abort on its first device
 run.
 
