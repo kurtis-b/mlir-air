@@ -1788,6 +1788,32 @@ and breaks <strong>3 other tests</strong> in the suite — the new test catches 
 suite catches over-refusal. Suite <strong>539 passed / 553, 0 failures</strong> (baseline 538/552 + this test).</p>
 <p><strong>The 2-row herd is still blocked</strong> — this changes an abort into an explanation, nothing more.
 Options (1) and (2) remain the actual fix.</p>
+<p><strong>Option (1) attempted 2026-09-05, and it uncovered a second, independent defect.</strong> The structural
+half alone — widen <code>infoEntryTy</code> to <code>&lt;split_dim, split_affine_map, split_affine_map_operands,
+split_offset, split_size, split_stride&gt;</code>, populate the operands at the producer, read them
+<strong>nowhere</strong> — should be behaviour-neutral. It is not:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>FAIL: Transform/AIRMiscPasses/air_split_l2_memref.mlir
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>  #3 __memcpy_avx512_unaligned_erms
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>  #4 llvm::SmallVectorImpl&lt;mlir::Value&gt;::operator=(...)
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>  #5 xilinx::AIRSplitL2MemrefForBufferConstraintPass::runOnOperation()
+</code></pre></div>
+<p>A <strong>segfault</strong>, on an existing test, from adding a field nothing reads. Suite 538/553 with the
+change, back to <strong>539/553 with it reverted</strong>, so it is unambiguously the change.</p>
+<p><strong>The cause is NOT established, and a first attempt at explaining it was measured and refuted.</strong>
+The tempting story — "the tuple was all-POD, so a dangling copy survived by accident until a
+heap-allocating member made it fatal" — rests on the old tuple being trivially copyable. It is not:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">static_assert</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">is_trivially_copyable</span><span class="o">&lt;</span><span class="n">infoEntryTy</span><span class="o">&gt;::</span><span class="n">value</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="c1">//  -&gt; error: static assertion failed   (on the tuple as it stands today)</span>
+</code></pre></div>
+<p>So that mechanism is wrong. <code>SmallVector&lt;Value&gt;</code> may also sit in inline storage, and the trace
+stops at <code>runOnOperation()</code> with no line info, so the copy site is unidentified. <strong>What is
+established is only the A/B</strong>: adding a field nothing reads crashes an existing single-symbol test,
+and reverting restores 539/553. The cause is <strong>unknown</strong>, and settling it needs a
+line-symbolized or ASan build — the insertion into <code>opToSplitInfoMap</code> while iterating
+(<code>AIRMiscPasses.cpp:3315-3329</code>) is a <em>candidate</em>, not a finding.</p>
+<p>The consequence for the port holds regardless of mechanism: <strong>option (1) cannot proceed until that
+crash is understood</strong>, because it requires exactly the change that triggers it. Reverted; no code
+proposed.</p>
 <p>Both asserts are reproducible in seconds against the committed input above, so a candidate can be
 checked before it is believed — that is how <code>971bab2a</code>, "keep the counts", and "canonicalize at the
 create site" were each eliminated. No compiler change is proposed from any of them; the tree is
