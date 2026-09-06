@@ -169,22 +169,21 @@ assertion. Only two commits have touched `mlir/` since Aug 30 and both are #66's
 preserving refactor. Method note: an earlier replay with *guessed* flags produced a different error
 (`'air.dma_memcpy_nd' op failed to get buffer`) — capture the argv, do not reconstruct it.
 
-**Minimal reproducer — host-only, one second**, down from a full device example build:
+**Minimal reproducer — host-only, one second, and committed** so it can actually be run:
 
 ```sh
-# 1. the module aircc feeds to the pass (24-pass prefix of aircc's own pipeline)
-air-opt air.mlir --pass-pipeline="builtin.module(<prefix up to air-split-l2-memref>)" > pre-split.mlir
-# 2. the crash, on its own
-air-opt pre-split.mlir \
+air-opt mlir/test/Transform/AIRMiscPasses/Inputs/split_l2_herd_rows2_pre_split.mlir \
   --air-split-l2-memref="max-launch-channels-mm2s=16 max-launch-channels-s2mm=16 tiles-per-l2-tile=4"
-#    -> Assertion `willBeValidAffineMap(...)' failed
-#       AIRSplitL2MemrefForBufferConstraintPass -> tileChannelOpByFactor
+#  -> Assertion `willBeValidAffineMap(...)' failed.
+#     AIRSplitL2MemrefForBufferConstraintPass -> tileChannelOpByFactor
 ```
 
-`pre-split.mlir` is **124 lines**. `air.mlir` comes from `feat/matvec-herd-rows` at
-`--m 2048 --k 8192 --tile-m 2 --m-input 1 --herd-m 4 --herd-rows 2`, and the pipeline prefix is
-printed by aircc's own `-v`. Nothing here needs the NPU, so this is now a compiler-debugging loop
-of seconds rather than a device job.
+The input is **143 lines** and lives under `Inputs/`, which `mlir/test/lit.cfg.py:93` excludes from
+the testsuite — it has to, since running the pass on it aborts `air-opt`. Its header records where
+it came from: aircc's own 24-pass prefix (printed by `aircc -v`) applied to the matvec GEMV example
+built with a 2-row herd on `feat/matvec-herd-rows`, and the pass options are the ones aircc uses at
+that stage. Nothing here needs the NPU, so this is a compiler-debugging loop of seconds — and any
+candidate fix can be checked against it by anyone, which is how `971bab2a` was eliminated above.
 
 **What it is not**: the same shape as the `multi_symbol_offset` lit (which passes on main, ported
 in #82), and not fixed by `971bab2a`.
