@@ -87,9 +87,13 @@ def _compile_mv_int4_bf16_matmul(tile_m=16, tile_n=16, k_chunk=128, gs=128):
     invalidates the other's cache.
     """
     src = _PROJ_ROOT / "matrix_vector_multiplication" / "int4_awq" / "mv_int4_bf16.cc"
+    # The name carries every build-affecting flag: `_compile_kernel` skips a
+    # rebuild when the file exists, so a name omitting the group size lets a
+    # 128-built object satisfy a --gs 64 run.
+    tagged = f"mv_int4_bf16_matmul_m{tile_m}_n{tile_n}_k{k_chunk}_gs{gs}.o"
     _compile_kernel(
         src,
-        "mv_int4_bf16_matmul.o",
+        tagged,
         extra_flags=[
             f"-DDIM_M={tile_m}",
             f"-DDIM_N={tile_n}",
@@ -98,7 +102,7 @@ def _compile_mv_int4_bf16_matmul(tile_m=16, tile_n=16, k_chunk=128, gs=128):
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         ],
     )
-    shutil.copy2("mv_int4_bf16_matmul.o", "mv_int4_bf16.o")
+    shutil.copy2(tagged, "mv_int4_bf16.o")
 
 
 def _compile_mm_bf16_x_bfp16(tile_m=32, tile_n=32, tile_k_l1=128):
@@ -122,23 +126,98 @@ def _compile_mm_bf16_x_bfp16(tile_m=32, tile_n=32, tile_k_l1=128):
 
 _INT4_TILE_N = 16  # overridden by --tile-n
 
+# GROUP SIZE, a module global for the same reason `_INT4_TILE_N` is one: the
+# `int4_gs` that `compile_and_cache` forwards is ITS OWN default and knows
+# nothing of this driver's `--gs`. Until this existed, `--gs` reached the HOST
+# packer alone and the kernel was compiled at a hardcoded 128, so a checkpoint
+# at any other group size packed at one and dequantized at another -- wrong
+# with no failure anywhere, since both halves are individually well formed.
+# The flag WAS read, so the dead-flag audit in `verify/test_verify_runner.py`
+# could not see it; `test_prefill_gs_reaches_kernel.py` is the behavioural
+# test that file asks for.
+_INT4_GS = 128  # overridden by --gs; MUST equal the gs load_awq_weights packs at
 
-def _prepare_air_project_int4(quant=None, int4_gs=128, int4_k_chunk=2048):
+
+def cached_elf_build_gs(elf):
+    """The group size a cached ELF was built at.
+
+    A sidecar `<name>.build.json` records it. **No sidecar means 128**, and
+    that is an inference with a proof rather than a default: until the fix
+    above, the group size could not reach the kernel compile at all, so every
+    ELF ever written to one of these caches was built at 128 whatever `--gs`
+    said.
+    """
+    import json as _json
+
+    side = Path(elf).with_suffix(".build.json")
+    if side.is_file():
+        return int(_json.loads(side.read_text()).get("int4_gs", 128))
+    return 128
+
+
+def record_elf_build_gs(elf, gs, tile_n):
+    """Record the group size an ELF was just built at, beside the ELF.
+
+    Written per compile, not swept at the end: a run that fails partway would
+    otherwise leave a valid expensive artifact with no sidecar, which the
+    retry reads as legacy 128 and refuses.
+    """
+    import json as _json
+
+    elf = Path(elf)
+    if elf.is_file():
+        elf.with_suffix(".build.json").write_text(
+            _json.dumps({"int4_gs": gs, "tile_n": tile_n}, indent=1), encoding="utf-8"
+        )
+
+
+def check_cached_elf_gs(elf, want_gs, int4=True):
+    """Refuse to reuse an int4 ELF built at a different group size.
+
+    Raises `SystemExit`. Returns the built gs when reuse is allowed. Non-int4
+    ELFs are never refused -- the bf16 and bfp16 stitchers do not link the
+    int4 GEMV and must not be blocked by a group size they never used.
+    """
+    built = cached_elf_build_gs(elf)
+    if int4 and built != want_gs:
+        raise SystemExit(
+            f"{elf} was built at gs={built} but this run packs at --gs {want_gs}. "
+            "Packing at one group size and dequantizing at another is a silent "
+            f"wrong answer. Use a different --cache-dir for gs={want_gs}, or "
+            "delete this one."
+        )
+    return built
+
+
+def _prepare_air_project_int4(quant=None, int4_gs=None, int4_k_chunk=2048):
     """Replacement for cache.prepare_air_project: wipe + repopulate
     air_project/ with `mv_int4_bf16.o` (GEMM flags), `rope.o`, and
     `silu_and_mul.o`. `quant` is accepted for cache.compile_and_cache
     compatibility but unused (the kernel flavor is determined here);
-    `int4_gs` is the group size cache.compile_and_cache forwards from the
-    backend kwargs and is baked into the GEMM object. `int4_k_chunk` is
-    likewise forwarded and unused here (the GEMM object bakes its own
-    DIM_K_CHUNK=128)."""
+    The group size baked into the GEMM object is `_INT4_GS` -- the driver's
+    own `--gs`, the same value `load_awq_weights` packs with -- so the two
+    halves agree by construction. `compile_and_cache` also forwards an
+    `int4_gs` from the backend kwargs, but that is ITS default (128) with no
+    knowledge of this driver's `--gs`; honouring it is what produced the
+    packed-at-64 / dequantized-at-128 defect. It is therefore ignored, except
+    that a caller who passes a value DISAGREEING with `--gs` is refused rather
+    than silently overridden: two channels for one number is the shape of the
+    original bug. `int4_k_chunk` is likewise forwarded and unused here (the
+    GEMM object bakes its own DIM_K_CHUNK=128)."""
     del quant, int4_k_chunk
+    if int4_gs is not None and int4_gs != 128 and int4_gs != _INT4_GS:
+        raise ValueError(
+            f"int4_gs={int4_gs} was routed through compile_and_cache but this "
+            f"driver packed at --gs {_INT4_GS}. Packing at one group size and "
+            "dequantizing at another is a silent wrong answer; refusing rather "
+            "than choosing one."
+        )
     air_proj = Path("air_project")
     if air_proj.exists():
         shutil.rmtree(air_proj)
     air_proj.mkdir(parents=True, exist_ok=True)
 
-    _compile_mv_int4_bf16_matmul(tile_n=_INT4_TILE_N, gs=int4_gs)
+    _compile_mv_int4_bf16_matmul(tile_n=_INT4_TILE_N, gs=_INT4_GS)
     compile_rope()
     compile_silu_and_mul()
     compile_attn_npu2()
@@ -1007,8 +1086,9 @@ def main():
         "gate. Used by `make diagnosis`.",
     )
     args = ap.parse_args()
-    global _INT4_TILE_N
+    global _INT4_TILE_N, _INT4_GS
     _INT4_TILE_N = args.tile_n
+    _INT4_GS = args.gs
 
     # int4 prefill needs the GEMM-flavored mv_int4_bf16.o under air_project/;
     # bfp16 prefill needs mm_bf16_x_bfp16.o.
@@ -1061,11 +1141,22 @@ def main():
     # kernel_sym must match the actual ELF symbol (= XRTBackend's
     # `instance_name` arg); it is NOT always equal to the cache key (e.g.
     # flash_attn ships as `attention_bf16`).
+    def _compile_and_record(name, module, backend):
+        """`cache.compile_and_cache`, plus this run's group size beside the ELF."""
+        cache.compile_and_cache(name, module, backend)
+        record_elf_build_gs(
+            Path(args.cache_dir) / f"{name}.elf", _INT4_GS, _INT4_TILE_N
+        )
+
     def _need(name, kernel_sym=None):
         if kernel_sym is None:
             kernel_sym = name
         elf = Path(args.cache_dir) / f"{name}.elf"
         if elf.exists():
+            # A cached ELF links that object, so it carries a group size its
+            # name does not show; reuse across --gs is the same silent wrong
+            # answer one level up. Only int4 ELFs link the int4 GEMV.
+            check_cached_elf_gs(elf, _INT4_GS, int4="int4" in name)
             print(f"  using cached {name}.elf ({elf.stat().st_size//1024} KB)")
             from air.backend.xrt import XRTCompileArtifact
 
@@ -1094,7 +1185,7 @@ def main():
 
             if _need("rms_gemms_rope_int4"):
                 print("\nCompiling rms_gemms_rope_int4...")
-                cache.compile_and_cache(
+                _compile_and_record(
                     "rms_gemms_rope_int4",
                     build_rms_gemms_rope_int4_module(
                         seq_len=seq_len,
@@ -1110,7 +1201,7 @@ def main():
                 )
             if _need("o_ffn_int4"):
                 print("Compiling o_ffn_int4...")
-                cache.compile_and_cache(
+                _compile_and_record(
                     "o_ffn_int4",
                     build_o_ffn_int4_module(
                         seq_len=seq_len,
@@ -1131,7 +1222,7 @@ def main():
 
             if _need("rms_gemms_rope_bfp16"):
                 print("\nCompiling rms_gemms_rope_bfp16...")
-                cache.compile_and_cache(
+                _compile_and_record(
                     "rms_gemms_rope_bfp16",
                     build_rms_gemms_rope_bfp16_module(
                         seq_len=seq_len,
@@ -1145,7 +1236,7 @@ def main():
                 )
             if _need("o_ffn_bfp16"):
                 print("Compiling o_ffn_bfp16...")
-                cache.compile_and_cache(
+                _compile_and_record(
                     "o_ffn_bfp16",
                     build_o_ffn_bfp16_module(
                         seq_len=seq_len,
@@ -1179,7 +1270,7 @@ def main():
                     build_rms_gemms_rope_module,
                 )
 
-                cache.compile_and_cache(
+                _compile_and_record(
                     "rms_gemms_rope",
                     build_rms_gemms_rope_module(
                         seq_len,
@@ -1195,7 +1286,7 @@ def main():
                 print("Compiling o_ffn (bf16)...")
                 from shared.builders.o_ffn_multi import build_o_ffn_module
 
-                cache.compile_and_cache(
+                _compile_and_record(
                     "o_ffn",
                     build_o_ffn_module(seq_len, emb_dim, hidden_dim),
                     {"verbose": args.verbose, **O_FFN_BACKEND},
@@ -1210,7 +1301,7 @@ def main():
 
             lkp = head_dim
             enable_shared = lkp == head_dim
-            cache.compile_and_cache(
+            _compile_and_record(
                 "flash_attn",
                 build_attn(
                     lk=seq_len,
@@ -1239,6 +1330,14 @@ def main():
     elif not args.skip_npu and args.run_only:
         if not cache.load_manifest():
             raise SystemExit(f"--run-only but no manifest at {args.cache_dir}")
+        # --run-only never calls `_need`, so without this the guard above is
+        # bypassed entirely: `--run-only --gs 64` against a cache built at 128
+        # packs at 64 and executes the 128 ELFs -- the original defect, one
+        # entry point over. Same validator, same refusal.
+        for _name in cache.artifacts:
+            _elf = Path(args.cache_dir) / f"{_name}.elf"
+            if _elf.is_file():
+                check_cached_elf_gs(_elf, _INT4_GS, int4="int4" in _name)
 
     if args.compile_only:
         # Marker matched by run_npu2_compile.lit.

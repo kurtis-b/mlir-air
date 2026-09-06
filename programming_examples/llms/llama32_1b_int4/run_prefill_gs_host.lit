@@ -1,0 +1,18 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Host-only: `--gs` must reach the GEMM micro-kernel, not only the host
+// packer. Compiles nothing: the kernel builders are replaced with recorders,
+// so what is asserted is the flags the driver WOULD have passed to Peano.
+// Rationale and history are in the test's own docstring.
+//
+// RUN: %PYTHON %S/test_prefill_gs_reaches_kernel.py | FileCheck %s
+// CHECK: PASS  test_the_recorder_sees_a_real_compile
+// CHECK: PASS  test_gs_reaches_the_gemm_kernel
+// CHECK: PASS  test_a_stale_gemm_object_is_not_reused_across_group_sizes
+// CHECK: PASS  test_the_cache_object_name_carries_every_build_affecting_flag
+// CHECK: PASS  test_a_stale_ELF_is_refused_at_a_different_group_size
+// CHECK: PASS  test_run_only_validates_the_cached_group_size_too
+// CHECK: PASS  test_the_audit_can_actually_fail
+// CHECK: PASS  test_disagreeing_channels_are_refused
+// CHECK: prefill gs-reaches-kernel tests: 8/8 passed
