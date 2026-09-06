@@ -1,0 +1,24 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Host-only: `--gs` must reach the GEMM micro-kernel, not only the host
+// packer. Until this landed the prefill driver packed the weights at `--gs`
+// and compiled the kernel at a hardcoded 128, so `--gs 64` dequantized in the
+// wrong groups -- a wrong answer with nothing failing anywhere, since both
+// halves are individually well formed. The flag WAS read, so the dead-flag
+// audit in verify/test_verify_runner.py could not see it; that file names this
+// exact gap and asks for a behavioural test. This is it.
+//
+// Nothing is compiled: the kernel builders are replaced with recorders, so
+// what is asserted is the flags the driver WOULD have passed to Peano, which
+// is where the defect was. No device, no checkpoint, no HF weights.
+//
+// RUN: %PYTHON %S/test_prefill_gs_reaches_kernel.py | FileCheck %s
+// CHECK: PASS  test_the_recorder_sees_a_real_compile
+// CHECK: PASS  test_gs_reaches_the_gemm_kernel
+// CHECK: PASS  test_a_stale_gemm_object_is_not_reused_across_group_sizes
+// CHECK: PASS  test_the_cache_object_name_carries_every_build_affecting_flag
+// CHECK: PASS  test_a_stale_ELF_is_refused_at_a_different_group_size
+// CHECK: PASS  test_the_audit_can_actually_fail
+// CHECK: PASS  test_disagreeing_channels_are_refused
+// CHECK: prefill gs-reaches-kernel tests: 7/7 passed
