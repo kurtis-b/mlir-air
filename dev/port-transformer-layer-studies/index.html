@@ -1530,9 +1530,49 @@ F-cluster prerequisite</strong> — and it is a <em>specific</em> one, not "some
 <li>and <strong>the tag's regression test for that case is absent from main</strong> (<code>git ls-files</code> finds it on
   the tag, not on main), so nothing pins the multi-symbol-offset shape either way.</li>
 </ul>
-<p>The concrete F row to take before LM-head is therefore: port the tag's
-<code>air_split_l2_memref_multi_symbol_offset.mlir</code> as a failing case, establish whether <code>971bab2a</code>'s
-form handles the input <code>HERD_ROWS=2</code> produces where <code>48225ba5</code>'s does not, and fix from there.
+<p><strong>Tested 2026-09-05 with the test's COMPLETE RUN line — the tag's test FAILS on main, so the
+prerequisite stands.</strong> Two runs, because the first measured only half the gate:</p>
+<table>
+<thead>
+<tr>
+<th>what was run</th>
+<th>result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>air-opt … --air-split-l2-memref=…</code> alone</td>
+<td><strong>exit 0</strong> — main does <em>not</em> assert on this input</td>
+</tr>
+<tr>
+<td>the test's actual RUN line, <code>air-opt … \| FileCheck %s</code></td>
+<td><strong>exit 1</strong>: <code>multi_symbol_offset.mlir:198: error: CHECK: expected string not found</code></td>
+</tr>
+</tbody>
+</table>
+<p>So <code>48225ba5</code> (#1934) changed the <em>failure mode</em> without preserving the <em>behaviour the tag pinned</em>:
+main stopped asserting on the multi-symbol offset, and now emits a different channel put than the
+test requires — line 198 wants <code>air.channel.put …[%c0, %[[Q0]], %c0, …]</code> and main produces an extra
+<code>affine.apply #map3()[%arg3, %arg5]</code> feeding a different operand list. <strong>That is a real, observable
+delta, not a supersession</strong>, so 4a's SUPERSEDED classification for <code>971bab2a</code> is at best partial.</p>
+<p>Method worth recording with the result: <strong>exit 0 from the producer is not a passing test when the
+RUN line pipes into FileCheck.</strong> Reading the producer's exit code and skipping every output
+assertion is the same "half a gate" error this ledger has already paid for.</p>
+<p>The crash is therefore a <strong>different</strong> shape from the one the tag fixed, and finding it is the
+work. What is established:</p>
+<ul>
+<li><strong>The reproducer is host-only — no device, no devq</strong>, which is much cheaper than how it was
+  first found: on <code>feat/matvec-herd-rows</code>,
+  <code>python3 matvec.py --compile-mode compile-and-xclbin --m 2048 --k 8192 --tile-m 2 --m-input 1
+  --herd-m 4 --herd-rows 2</code> aborts with the same assertion.</li>
+<li>Running <code>--air-split-l2-memref</code> <strong>alone</strong> on the builder's own output does <em>not</em> crash (exit 0),
+  so the offending map is produced by the aircc pipeline's earlier passes, not by the emitted IR
+  as written.</li>
+</ul>
+<p>Next step: port <code>air_split_l2_memref_multi_symbol_offset.mlir</code> as the failing case it is (CHECK
+line 198), decide whether <code>971bab2a</code>'s form is the right fix on top of #1934 or whether the test's
+expectations should move, and only then return to <code>HERD_ROWS=2</code>. The host-only reproducer above
+stays the end-to-end check; the lit is the narrow one.
 Any plan that schedules the LM-head family as an E-side slice hits this abort on its first device
 run.</p>
 <p>The plumbing is preserved, unmerged, on <code>feat/matvec-herd-rows</code> (<code>0b7a27a8</code>) with its evidence in
