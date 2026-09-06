@@ -134,10 +134,30 @@ work. What is established:
   so the offending map is produced by the aircc pipeline's earlier passes, not by the emitted IR
   as written.
 
-Next step: port `air_split_l2_memref_multi_symbol_offset.mlir` as the failing case it is (CHECK
-line 198), decide whether `971bab2a`'s form is the right fix on top of #1934 or whether the test's
-expectations should move, and only then return to `HERD_ROWS=2`. The host-only reproducer above
-stays the end-to-end check; the lit is the narrow one.
+**Answered 2026-09-05: the expectations move, because main's behaviour is deliberately different —
+not wrong.** The test failed at CHECK 198 only in the **third offset slot**: it pins `%c0` there,
+main emits the base's own `affine.apply`. That is intentional and documented in the pass itself —
+`getOriginalApplyOperands` propagates a non-zero base on the split dim rather than zeroing it
+"just because the access happens to be contiguous". Everything the test was written to pin — one
+put per split, each carrying its own `Q_i` on the split dimension, in split order — holds on main.
+
+So the row closes as a **ported regression test, no compiler change**: the lit is on main with that
+one slot relaxed and the divergence documented at the CHECK. Mutation-checked so the relaxation did
+not hollow it out — swapping `Q0`/`Q1`, giving split 1 the wrong `Q`, and using a wrong split index
+each turn it red. Suite: **538 passed / 552, 0 failures** (the recorded 537/551 baseline plus this
+test).
+
+**Two things this did NOT establish, stated so they are not assumed:**
+
+1. **It does not explain the `HERD_ROWS=2` crash.** That is a different shape — this test never
+   asserted on main. The host-only reproducer above remains open and unexplained.
+2. **Main is still missing `971bab2a`'s operand-ordering guarantee.** Its `air::ExecuteOp` branch
+   builds `originalApplyOperands` from `getUsedValuesDefinedAbove`, an unordered set, while the
+   replacement map reuses the apply's expression verbatim — so symbol *i* need not bind to operand
+   *i*. `mapForExpr` (#1934) removed the assert that used to hide this. I applied `971bab2a`'s fix
+   for it, found it changed **nothing observable** on this test, and **reverted it**: an unverified
+   compiler change with no failing test behind it is not something to land. It is a real candidate
+   for whatever reproduces the `HERD_ROWS=2` shape.
 Any plan that schedules the LM-head family as an E-side slice hits this abort on its first device
 run.
 
