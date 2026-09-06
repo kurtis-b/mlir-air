@@ -1321,6 +1321,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#root-cause-2026-09-05-the-split-info-entry-stores-a-map-without-its-operands" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ROOT CAUSE (2026-09-05): the split-info entry stores a map without its operands
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1733,6 +1744,37 @@ operand is supplied. A fix has to rebase the second expression's symbols above t
 concatenate the operand lists, not just add the expressions.</p>
 <p>Note the ordering: these malformed creates are only <em>reachable</em> once assert 1 is bypassed by the
 counts fix, which is why assert 2 appeared to be a separate downstream problem.</p>
+<h3 id="root-cause-2026-09-05-the-split-info-entry-stores-a-map-without-its-operands">ROOT CAUSE (2026-09-05): the split-info entry stores a map without its operands<a class="headerlink" href="#root-cause-2026-09-05-the-split-info-entry-stores-a-map-without-its-operands" title="Permanent link">&para;</a></h3>
+<p>Following the dangling symbol back to its producer (<code>AIRMiscPasses.cpp:2856</code>):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">AffineMap</span><span class="w"> </span><span class="n">applyMap</span><span class="p">;</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="k">auto</span><span class="w"> </span><span class="n">apply</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">getAffineMapOnMemrefSplitDim</span><span class="p">(</span><span class="n">ci</span><span class="p">,</span><span class="w"> </span><span class="o">*</span><span class="n">offsetDimOpt</span><span class="p">);</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">apply</span><span class="p">)</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">  </span><span class="n">applyMap</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">apply</span><span class="p">.</span><span class="n">getAffineMap</span><span class="p">();</span><span class="w">          </span><span class="c1">// &lt;- the operands are dropped here</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="n">infoEntryTy</span><span class="w"> </span><span class="n">newEntry</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="o">*</span><span class="n">offsetDimOpt</span><span class="p">,</span><span class="w"> </span><span class="n">applyMap</span><span class="p">,</span><span class="w"> </span><span class="n">splitDimOffset</span><span class="p">,</span><span class="w"> </span><span class="p">...};</span>
+</code></pre></div>
+<p><code>infoEntryTy</code> is <code>&lt;split_dim, split_affine_map, split_offset, split_size, split_stride&gt;</code> — it
+carries <strong>a map and no operands</strong>. That is sound only while the stored map has exactly <strong>one</strong>
+symbol: composition substitutes <code>s0</code> with the split offset, the result is a constant, and nothing
+dangles. With a <strong>two</strong>-symbol map — which is what a multi-level loop nest produces, i.e. a herd
+with more than one row — substituting <code>s0</code> leaves <code>s1</code> referring to an operand that was never
+carried alongside it. <code>composeAffineExprWithOffsetAndAffineMap</code> then adds that residue to a
+<em>different</em> apply's expression and keeps only that apply's operand list, producing exactly the
+observed <code>()[s0, s1] -&gt; (s0 + s1)</code> with one operand.</p>
+<p>So both asserts are the same defect seen at two depths: a data structure that is only valid for
+single-symbol maps, used with a multi-symbol one.</p>
+<p><strong>Fix options, in order of honesty:</strong></p>
+<ol>
+<li><strong>Carry the operands.</strong> Store the producing apply's operands in <code>infoEntryTy</code> and use them when
+   composing, rebasing the stored map's symbols above the original expression's. Correct, and it
+   changes the tuple type and every user — a real slice, not a patch.</li>
+<li><strong>Re-find the producer at composition time</strong> and take its operands then, leaving the tuple
+   alone. Smaller, but it re-does a lookup the producer already did and can diverge from it.</li>
+<li><strong>Refuse the multi-symbol case</strong> with a clear diagnostic instead of asserting. Does not unblock
+   the 2-row herd, but turns a compiler abort into an explainable failure — worth doing regardless
+   of which of (1) or (2) lands, because an assert is never the right answer to unsupported input.</li>
+</ol>
+<p>Only (3) is safe to ship without a numerical gate; (1) and (2) change generated code and need the
+<code>make run</code> before/after that this ledger's other rows use.</p>
 <p>Both asserts are reproducible in seconds against the committed input above, so a candidate can be
 checked before it is believed — that is how <code>971bab2a</code>, "keep the counts", and "canonicalize at the
 create site" were each eliminated. No compiler change is proposed from any of them; the tree is
