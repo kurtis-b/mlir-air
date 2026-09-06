@@ -25,11 +25,11 @@ prefill handled:
      `o_gemv_ffn` stage-1 O-GEMV is square (emb x emb). We build Qwen
      variants: the Q GEMV is M=q_dim, the O GEMV is M=emb_dim, K=q_dim.
 
-  3. LM-head vocab = 151936 (not 128256). We split the vocab across
-     19 partitions of n_part=8192 each (19*8192 = 155648 >= 151936;
-     8192 % 64 == 0). n_part is capped at 8192 so the DMA repeat count
-     n_part/32 - 1 = 255 stays at the hardware limit. The trailing
-     partitions carry zero rows (logits truncated to vocab on host).
+  3. LM-head vocab = 151936 (not 128256). We split it as 9 x 16384 + 4480,
+     which sums to the vocabulary EXACTLY -- ten launches and no padding.
+     A partition is capped at (255 + 1) * herd_m * m_input rows by the DMA
+     repeat count, so 16384 needs m_input 8; at m_input 4 the ceiling is
+     8192, which is why this was 19 x 8192 = 155648 with 3712 padded rows.
 
 Decode attention is CPU (decode_attention_cpu), matching llama.
 """
@@ -90,7 +90,7 @@ def required_decode_artifacts():
     `_O_FFN_KERNEL` the compile and dispatch paths use, so the check below
     can never drift from what `compile_decode_kernels` writes.
     """
-    return (_RMS_QKV_KERNEL, _O_FFN_KERNEL, "lm_head_gemv")
+    return (_RMS_QKV_KERNEL, _O_FFN_KERNEL, _LM_KERNEL)
 
 
 def require_decode_artifacts(cache):
@@ -251,12 +251,33 @@ def run_rms_qkv(
 
 # LM-head decode partitioning. vocab=151936.
 # Per-partition GEMV broadcasts the K=emb_dim input vector with a hardware
-# push_queue repeat_count ~= n_part/32 - 1, capped at the [0:255] range. So
-# n_part must be <= 8192 (8192/32 - 1 = 255). 19 * 8192 = 155648 >= 151936;
-# the final partition carries 3712 zero-padded rows (logits truncated to
-# vocab on host).
-_LM_N_PARTITIONS = 19
-_LM_N_PART = 8192  # % 64 == 0; n_part/32 - 1 = 255 (at the repeat-count limit)
+# push_queue repeat_count capped at the [0:255] range, so a partition may be
+# at most (255 + 1) * herd_m * m_input rows. At m_input 4 that is 8192, which
+# is why this head was 19 x 8192 = 155648: 3712 rows of padding past the
+# 151936-row vocabulary, and 19 launch boundaries.
+#
+# At m_input 8 the ceiling doubles to 16384, and the vocabulary then divides
+# EXACTLY as 9 x 16384 + 4480 -- ten launches, no padding at all. The tail
+# still sits on the tile grid (4480 % (tile_m 8 * herd_m 8) == 0), which
+# `build_lm_head_gemv_module` checks.
+_LM_M_INPUT = 8
+_LM_PARTS = [16384] * 9 + [4480]  # sums to 151936, the vocabulary exactly
+_LM_N_PARTITIONS = len(_LM_PARTS)
+# Kept because the shared `run_lm_head` and this model's weight slicing take
+# it as the equal-split shorthand; `_LM_PARTS` is what actually decides the
+# partitioning now.
+_LM_N_PART = _LM_PARTS[0]
+
+# The cache artifact key is versioned with the partitioning, exactly as
+# `_RMS_QKV_KERNEL` is versioned with its launch count and for the same
+# reason: the host ABI is 1 + 2 * len(_LM_PARTS) buffers, so a decode cache
+# compiled before this change holds a 39-argument ELF while the caller now
+# passes 21. `load_manifest()` would accept it -- same toolchain, same key --
+# and the mismatch surfaces on the device, not at load. A distinct key makes a
+# stale cache a clean "recompile" error from `require_decode_artifacts`
+# instead. The ELF's own instance_name stays `lm_head_gemv`: it must match the
+# func the builder emits.
+_LM_KERNEL = f"lm_head_gemv_p{len(_LM_PARTS)}"
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +409,7 @@ def build_o_gemv_ffn_int4_qwen_module(emb_dim, q_dim, hidden_dim):
 
 
 # ---------------------------------------------------------------------------
-# Builder 2: LM-head GEMV (19 partitions, n_part=8192 for vocab 151936).
+# Builder 2: LM-head GEMV (9 x 16384 + 4480 for vocab 151936, m_input 8).
 # ---------------------------------------------------------------------------
 
 
@@ -397,10 +418,9 @@ def build_lm_head_gemv_qwen_module(emb_dim):
 
     return build_lm_head_gemv_module(
         emb_dim=emb_dim,
-        n_partitions=_LM_N_PARTITIONS,
-        n_part=_LM_N_PART,
+        parts=_LM_PARTS,
         tile_m=8,
-        m_input=4,
+        m_input=_LM_M_INPUT,
         herd_m=8,
     )
 
@@ -569,9 +589,9 @@ def compile_decode_kernels(cache, config, verbose=False):
             _o_gemv_ffn_backend(verbose),
         )
 
-    print("\n--- lm_head_gemv (19-partition, vocab 151936) ---")
+    print("\n--- lm_head_gemv (9 x 16384 + 4480, vocab 151936) ---")
     cache.compile_and_cache(
-        "lm_head_gemv",
+        _LM_KERNEL,
         build_lm_head_gemv_qwen_module(emb_dim),
         _lm_gemv_backend(verbose),
     )

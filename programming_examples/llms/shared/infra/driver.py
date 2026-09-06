@@ -500,30 +500,53 @@ def run_lm_head(
     lm_gemv_backend,
     n_partitions,
     n_part,
+    parts=None,
+    kernel_name="lm_head_gemv",
 ):
     """The partitioned NPU LM-head GEMV.
 
     `n_partitions`/`n_part` are this model's vocabulary split (`_LM_N_PARTITIONS`
     and `_LM_N_PART`) and `lm_gemv_backend` its backend selector — all three live
     in `<model>_decode`, which is why they are injected rather than imported.
+
+    `kernel_name` is the cache artifact key. It defaults to the historical
+    `lm_head_gemv`; a model whose host ABI has changed versions the key (as
+    `_RMS_QKV_KERNEL` does) so a stale cache cannot bind one ABI to the
+    other's ELF.
+
+    `parts` overrides the equal split with an explicit list of partition row
+    counts, matching `build_lm_head_gemv_module`'s argument of the same name. A
+    vocabulary that is not a whole multiple of the partition size can then end
+    in a shorter tail instead of being padded up to one. Omit it and the
+    behaviour is exactly the equal split, which is what every caller but
+    Qwen3-0.6B uses.
     """
+    if parts is None:
+        parts = [n_part] * n_partitions
+    parts = list(parts)
+    n = len(parts)
+
     lm_inputs = [x_normed_bf16.flatten().astype(bfloat16)]
     out_idx = []
-    for p in range(n_partitions):
+    for p, rows in enumerate(parts):
         lm_inputs.append(weights._lm_weight_parts_gemv[p])
-        lm_inputs.append(np.zeros(n_part, dtype=bfloat16))
+        lm_inputs.append(np.zeros(rows, dtype=bfloat16))
         out_idx.append(2 + 2 * p)
     res = decode_cache.load_and_run(
-        "lm_head_gemv",
+        kernel_name,
         lm_gemv_backend(),
         *lm_inputs,
         output_indices=out_idx,
-        static_input_indices={1 + 2 * p for p in range(n_partitions)},
-        intermediate_indices={2 + 2 * p for p in range(n_partitions)},
+        static_input_indices={1 + 2 * p for p in range(n)},
+        intermediate_indices={2 + 2 * p for p in range(n)},
     )
     logits = np.zeros(vocab_size, dtype=np.float32)
-    for p in range(n_partitions):
-        n_start = p * n_part
-        n_end = min(n_start + n_part, vocab_size)
-        logits[n_start:n_end] = res[2 + 2 * p][: n_end - n_start].astype(np.float32)
+    # Running offset rather than p * n_part: with unequal partitions the p-th
+    # one no longer starts at a multiple of anything.
+    n_start = 0
+    for p, rows in enumerate(parts):
+        n_end = min(n_start + rows, vocab_size)
+        if n_end > n_start:
+            logits[n_start:n_end] = res[2 + 2 * p][: n_end - n_start].astype(np.float32)
+        n_start += rows
     return logits

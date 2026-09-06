@@ -54,6 +54,8 @@ from qwen3_0_6b_decode import (
     _lm_gemv_backend,
     _LM_N_PARTITIONS,
     _LM_N_PART,
+    _LM_PARTS,
+    _LM_KERNEL,
     _W4_DECODE,
     require_decode_artifacts,
     _run_o_gemv_ffn_int4,
@@ -192,6 +194,8 @@ def _run_lm_head(decode_cache, weights, x_normed_bf16, vocab_size):
         lm_gemv_backend=_lm_gemv_backend,
         n_partitions=_LM_N_PARTITIONS,
         n_part=_LM_N_PART,
+        parts=_LM_PARTS,
+        kernel_name=_LM_KERNEL,
     )
 
 
@@ -283,24 +287,27 @@ def _preload_decode_weights(decode_cache, weights, config):
             bo_key=f"o_gemv_ffn_L{li}",
         )
 
-    # LM-head GEMV weights (19 partitions, n_part=8192).
+    # LM-head GEMV weights, one buffer per partition of `_LM_PARTS`
+    # (9 x 16384 + 4480). Running offset, not p * n_part: the partitions are
+    # no longer all the same height.
     weights._lm_weight_parts_gemv = []
-    for p in range(_LM_N_PARTITIONS):
-        n_start = p * _LM_N_PART
-        n_end = min(n_start + _LM_N_PART, vocab_size)
-        w = np.zeros((_LM_N_PART, emb_dim), dtype=bfloat16)
+    n_start = 0
+    for rows in _LM_PARTS:
+        n_end = min(n_start + rows, vocab_size)
+        w = np.zeros((rows, emb_dim), dtype=bfloat16)
         if n_end > n_start:
             w[: n_end - n_start, :] = np.ascontiguousarray(
                 weights.lm_head[n_start:n_end, :]
             ).astype(bfloat16)
         weights._lm_weight_parts_gemv.append(w)
+        n_start += rows
 
     lm_inputs = [np.zeros(emb_dim, dtype=bfloat16)]
     for p in range(_LM_N_PARTITIONS):
         lm_inputs.append(weights._lm_weight_parts_gemv[p])
         lm_inputs.append(np.zeros(_LM_N_PART, dtype=bfloat16))
     decode_cache.load_and_run(
-        "lm_head_gemv",
+        _LM_KERNEL,
         _lm_gemv_backend(),
         *lm_inputs,
         output_indices=[2 + 2 * p for p in range(_LM_N_PARTITIONS)],
@@ -314,7 +321,7 @@ def _preload_decode_weights(decode_cache, weights, config):
 
 
 # ---------------------------------------------------------------------------
-# NPU LM-head (19-partition GEMV) — shared by prefill end + decode.
+# NPU LM-head (9 x 16384 + 4480 GEMV) — shared by prefill end + decode.
 # ---------------------------------------------------------------------------
 
 

@@ -27,7 +27,7 @@ x ─[NPU elf:rms_qkv_qknorm_rope]   FUSED, 8 launches, 1 ELF
       (HOST) seq→head transpose → NPU FA → (HOST) head→seq transpose → attn_out[seq,2048]
   ─[NPU elf:o_ffn_qwen]   FUSED, 1 ELF
       { O GEMM + Add + RMSNorm + Gate + Up + SwiGLU + Down + Add } → layer_out[seq,1024]
-once: (HOST) final RMSNorm → [NPU elf:lm_head_gemv] (19 partitions ×8192, vocab 151936)
+once: (HOST) final RMSNorm → [NPU elf:lm_head_gemv] (9 ×16384 + 4480, vocab 151936)
 ```
 
 **Decode — 2 NPU ELFs/layer (+ lm_head once/token).** `[2026-08-26]` The

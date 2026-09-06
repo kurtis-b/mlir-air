@@ -15,11 +15,16 @@
 // compiler pads odd dispatches, and the branch recorded the 19 x 8192 form
 // re-executing clean once it did (devq 534).
 //
-// This gate is that check, on main. Main still ships the 19 x 8192 geometry,
-// and it reads 7/7 clean here (devq 934, and devq 935 with the control), which
-// confirms main carries the padding fix rather than being green by partition
-// parity. It is a regression guard: a builder or compiler change that brings
-// the family back turns this red.
+// This gate is that check. It read 7/7 clean on the 19 x 8192 geometry main
+// shipped until the ten-launch change (devq 934, and 935 with the control),
+// which confirmed main carries the padding fix rather than being green by
+// partition parity, and 7/7 clean again on the 9 x 16384 + 4480 geometry it
+// ships now (devq 940). It is a regression guard: a builder or compiler change
+// that brings the family back turns this red.
+//
+// The partition list comes from the decode module, so the gate always measures
+// the geometry the model actually ships -- reconstructing it independently read
+// 0/7 against a mismatched module (devq 939).
 //
 // The first line checked is a deliberately corrupted vector that the same
 // judge must reject. Without it a clean verdict would only mean the judge

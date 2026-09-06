@@ -738,6 +738,27 @@ def test_run_lm_head_truncates_the_last_partition_to_vocab_size():
     assert list(out) == [1.0, 2.0, 3.0], out
 
 
+# What each model's `_run_lm_head` must pass, exactly. `None` is the default
+# for the models whose vocabulary divides evenly into equal partitions.
+# Qwen3-0.6B is 9 x 16384 + 4480, so it MUST bind both the partition list and
+# the ABI-versioned artifact key -- omitting either is a device-level bug, not
+# a style choice, so neither is optional here.
+_LM_SHIM_EXPECTED = {
+    None: {
+        "lm_gemv_backend": "_lm_gemv_backend",
+        "n_partitions": "_LM_N_PARTITIONS",
+        "n_part": "_LM_N_PART",
+    },
+    "qwen3_0_6b": {
+        "lm_gemv_backend": "_lm_gemv_backend",
+        "n_partitions": "_LM_N_PARTITIONS",
+        "n_part": "_LM_N_PART",
+        "parts": "_LM_PARTS",
+        "kernel_name": "_LM_KERNEL",
+    },
+}
+
+
 def test_each_shim_binds_its_own_lm_head_partitioning():
     for m in LM_MODELS:
         tree = ast.parse((_LLMS / m / f"{m}_inference.py").read_text())
@@ -749,19 +770,106 @@ def test_each_shim_binds_its_own_lm_head_partitioning():
         assert len(fn) == 1, m
         call = [n for n in ast.walk(fn[0]) if isinstance(n, ast.Call)][0]
         kw = {k.arg: getattr(k.value, "id", None) for k in call.keywords}
-        assert kw == {
-            "lm_gemv_backend": "_lm_gemv_backend",
-            "n_partitions": "_LM_N_PARTITIONS",
-            "n_part": "_LM_N_PART",
-        }, (m, kw)
+        # PER MODEL, and exact. Making `parts` merely optional would be a
+        # weakening: dropping `parts=_LM_PARTS` from Qwen3-0.6B's shim would
+        # still pass, and `run_lm_head` would then build ten 16384-row outputs
+        # against a 9x16384+4480 ELF and corrupt the tail. Qwen3-0.6B must
+        # bind it; every other model must not have it at all.
+        required = dict(_LM_SHIM_EXPECTED.get(m, _LM_SHIM_EXPECTED[None]))
+        assert kw == required, (m, kw, required)
+        handles = list(required.values())
         origin = {}
         for n in ast.walk(tree):
             if isinstance(n, ast.ImportFrom):
                 for a in n.names:
                     origin[a.asname or a.name] = n.module or ""
         # the partitioning must come from THIS model's decode module
-        for handle in ("_lm_gemv_backend", "_LM_N_PARTITIONS", "_LM_N_PART"):
+        for handle in handles:
             assert origin.get(handle) == f"{m}_decode", (m, handle, origin.get(handle))
+
+
+def test_run_lm_head_parts_defaults_to_the_equal_split():
+    """`parts=None` must reproduce the equal split exactly, since eleven
+    drivers rely on it and none of them pass `parts`."""
+    calls = []
+
+    class FakeCache:
+        def load_and_run(self, name, backend, *inputs, **kw):
+            calls.append((list(inputs), kw))
+            # One output per partition, filled with its partition index so the
+            # assembled logits reveal WHICH partition each row came from.
+            out = {}
+            for i, idx in enumerate(kw["output_indices"]):
+                out[idx] = np.full(inputs[idx].shape[0], float(i), dtype=np.float32)
+            return out
+
+    class FakeWeights:
+        pass
+
+    def build(parts, n_partitions, n_part, vocab):
+        w = FakeWeights()
+        w._lm_weight_parts_gemv = [
+            np.zeros((r, 4), dtype=bfloat16)
+            for r in (parts if parts is not None else [n_part] * n_partitions)
+        ]
+        return driver.run_lm_head(
+            FakeCache(),
+            w,
+            np.zeros(4, dtype=bfloat16),
+            vocab,
+            lm_gemv_backend=lambda: {},
+            n_partitions=n_partitions,
+            n_part=n_part,
+            parts=parts,
+        )
+
+    implicit = build(None, 3, 8, 24)
+    explicit = build([8, 8, 8], 3, 8, 24)
+    assert np.array_equal(
+        implicit, explicit
+    ), "parts=[n_part]*n did not match the default"
+    # Non-vacuity: the assembled vector must actually be partitioned, not a
+    # single block -- otherwise the equality above would hold trivially.
+    assert list(implicit[[0, 8, 16]]) == [0.0, 1.0, 2.0], implicit[[0, 8, 16]]
+
+
+def test_run_lm_head_unequal_parts_land_at_running_offsets():
+    """Partitions must land at RUNNING offsets, not at `p * n_part`.
+
+    The shape matters: a short partition that comes LAST leaves every offset
+    equal to `p * n_part` anyway, so `[8, 8, 4]` cannot tell the two
+    arithmetics apart -- it passes under the old code too, which a mutation
+    run showed. `[8, 4, 8]` puts the short one in the middle, where the
+    arithmetics diverge (running 0/8/12 vs old 0/8/16).
+    """
+
+    class FakeCache:
+        def load_and_run(self, name, backend, *inputs, **kw):
+            return {
+                idx: np.full(inputs[idx].shape[0], float(i), dtype=np.float32)
+                for i, idx in enumerate(kw["output_indices"])
+            }
+
+    class FakeWeights:
+        pass
+
+    w = FakeWeights()
+    parts = [8, 4, 8]
+    w._lm_weight_parts_gemv = [np.zeros((r, 4), dtype=bfloat16) for r in parts]
+    logits = driver.run_lm_head(
+        FakeCache(),
+        w,
+        np.zeros(4, dtype=bfloat16),
+        20,
+        lm_gemv_backend=lambda: {},
+        n_partitions=len(parts),
+        n_part=8,
+        parts=parts,
+    )
+    # rows 0-7 from partition 0, 8-11 from the short middle, 12-19 from the last.
+    assert list(logits[[0, 7]]) == [0.0, 0.0], logits[:8]
+    assert list(logits[[8, 11]]) == [1.0, 1.0], logits[8:12]
+    assert list(logits[[12, 19]]) == [2.0, 2.0], logits[12:]
 
 
 if __name__ == "__main__":
