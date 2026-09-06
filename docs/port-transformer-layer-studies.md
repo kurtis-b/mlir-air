@@ -320,42 +320,53 @@ and breaks **3 other tests** in the suite — the new test catches the crash ret
 suite catches over-refusal. Suite **539 passed / 553, 0 failures** (baseline 538/552 + this test).
 
 **The 2-row herd is still blocked** — this changes an abort into an explanation, nothing more.
-Options (1) and (2) remain the actual fix.
 
-**Option (1) attempted 2026-09-05, and it uncovered a second, independent defect.** The structural
-half alone — widen `infoEntryTy` to `<split_dim, split_affine_map, split_affine_map_operands,
-split_offset, split_size, split_stride>`, populate the operands at the producer, read them
-**nowhere** — should be behaviour-neutral. It is not:
+**Options (1) and (2) are both the wrong shape — established 2026-09-06 by instrumenting the
+pass.** The abort's cause is no longer a hypothesis. `tileChannelOpByFactor` reads its split info
+from `splitInfoVec[i]`, indexed by **split number, not by op**. The op that aborts is the L2-fill
+`air.channel.get`, which carries *no offsets at all* and moves the whole 16-row slab in one
+transfer; it has no apply of its own, and the four entries it is handed were recorded for the
+**herd-side `@channel_2` puts**:
 
 ```
-FAIL: Transform/AIRMiscPasses/air_split_l2_memref.mlir
-  #3 __memcpy_avx512_unaligned_erms
-  #4 llvm::SmallVectorImpl<mlir::Value>::operator=(...)
-  #5 xilinx::AIRSplitL2MemrefForBufferConstraintPass::runOnOperation()
+RECORD op=air.channel.put @channel_2[%c0, %arg0] (%results[%26, 0] [1, 8192] [8192, 1])
+  applyMap=()[s0, s1] -> (s0 * 2 + s1)        (then + 4, + 8, + 12 for %c1..%c3)
+PROBE  chanOp=air.channel.get @channel_0[] (%results[] [] [])
+  splitInfoAffineMap=()[s0, s1] -> (s0 * 2 + s1)   affineApplyOp=(null)
+  originalApplyOperands=[%c0]
 ```
 
-A **segfault**, on an existing test, from adding a field nothing reads. Suite 538/553 with the
-change, back to **539/553 with it reverted**, so it is unambiguously the change.
+The constants are right — the four splits take rows +0/+4/+8/+12 of the slab. The **symbols** are
+herd induction variables naming rows *within* the slab, and they are not in scope at the fill. So
+the operands must not be carried (option 1) or re-found (option 2): there is nothing to bind them
+to. Each unbindable symbol contributes its base, 0, and the slab offset is what survives. Where
+the map has one symbol that is the substitution already performed, so no working case changes:
+**552 / 553, the single failure being `air_split_l2_memref_multi_symbol_refused.mlir`**, the test
+that pins the diagnostic it removes. The reviewer's `opToSplitInfoMap`-while-iterating candidate is
+*not* the mechanism — that loop copies nothing on this input (0 `UNROLL-COPY` events).
 
-**The cause is NOT established, and a first attempt at explaining it was measured and refuted.**
-The tempting story — "the tuple was all-POD, so a dangling copy survived by accident until a
-heap-allocating member made it fatal" — rests on the old tuple being trivially copyable. It is not:
+**It is still not landable, because clearing the abort exposes a second, independent defect.** The
+S2MM side mis-splits a 2-row herd: every L2 buffer holding herd row 1's outputs is filled and then
+only deallocated.
 
-```cpp
-static_assert(std::is_trivially_copyable<infoEntryTy>::value, ...);
-//  -> error: static assertion failed   (on the tuple as it stands today)
-```
+| L2 C buffer | shape | `channel.get` | `channel.put` to L3 |
+|---|---|---|---|
+| `%results_31/33/35/37` | `memref<2xbf16, 1>` | 1 | **0 — never drained** |
+| `%results_39/41/43/45` | `memref<4xbf16, 1>` | 1 (writes 2 of 4) | 1 (drains 4) |
 
-So that mechanism is wrong. `SmallVector<Value>` may also sit in inline storage, and the trace
-stops at `runOnOperation()` with no line info, so the copy site is unidentified. **What is
-established is only the A/B**: adding a field nothing reads crashes an existing single-symbol test,
-and reverting restores 539/553. The cause is **unknown**, and settling it needs a
-line-symbolized or ASan build — the insertion into `opToSplitInfoMap` while iterating
-(`AIRMiscPasses.cpp:3315-3329`) is a *candidate*, not a finding.
+Half of C would be dropped and half left garbage. Those maps carry **one** symbol, so this path is
+untouched by the substitution: it is pre-existing, and was masked by the abort. A compiler that
+silently drops half an output is worse than one that refuses, so main keeps the #88 diagnostic and
+the fix stays unlanded on `fix/split-l2-multi-symbol` (`78877b71`), evidence in its commit message.
 
-The consequence for the port holds regardless of mechanism: **option (1) cannot proceed until that
-crash is understood**, because it requires exactly the change that triggers it. Reverted; no code
-proposed.
+**Scope revised.** The blocker is not operand plumbing; it is that `air-split-l2-memref` does not
+model a herd whose *rows* subdivide the split dimension — the offset maps and the S2MM gather both
+assume a single row. Options (1)/(2)/(3) as costed above are superseded by that.
+
+*(The 2026-09-05 option-(1) segfault — adding an unread `SmallVector<Value>` field to `infoEntryTy`
+crashes `air_split_l2_memref.mlir` at 538/553, reverting restores 539/553 — remains unexplained.
+It is off the critical path now that the field it required is not wanted, and is recorded only as a
+latent hazard in the same structure.)*
 
 Both asserts are reproducible in seconds against the committed input above, so a candidate can be
 checked before it is believed — that is how `971bab2a`, "keep the counts", and "canonicalize at the
