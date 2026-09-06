@@ -30,6 +30,7 @@ WHY IT CAN RUN WITHOUT A DEVICE
 """
 
 import os
+import pathlib
 import sys
 import tempfile
 from pathlib import Path
@@ -200,6 +201,7 @@ _ORDER = (
     "test_a_stale_gemm_object_is_not_reused_across_group_sizes",
     "test_the_cache_object_name_carries_every_build_affecting_flag",
     "test_a_stale_ELF_is_refused_at_a_different_group_size",
+    "test_run_only_validates_the_cached_group_size_too",
     "test_the_audit_can_actually_fail",
     "test_disagreeing_channels_are_refused",
 )
@@ -287,6 +289,63 @@ def test_a_stale_ELF_is_refused_at_a_different_group_size():
         # (d) a NON-int4 ELF is never refused -- the bf16/bfp16 stitchers do not
         #     link the int4 GEMV and must not be blocked by its group size
         assert P.check_cached_elf_gs(elf, 128, int4=False) == 64
+
+
+def test_run_only_validates_the_cached_group_size_too():
+    """`--run-only` must be guarded as well as the compile path.
+
+    The compile path checks a cached ELF through `_need`. `--run-only` never
+    calls `_need` -- it loads the manifest directly -- so a guard placed only
+    in `_need` leaves `--run-only --gs 64` against a 128 cache packing at 64
+    and executing the 128 ELFs: the original defect, one entry point over.
+
+    Checked on the AST rather than by running main(), which would need a
+    checkpoint and a device. The assertion is that the branch which calls
+    `load_manifest` also calls `check_cached_elf_gs`.
+    """
+    import ast
+
+    tree = ast.parse(pathlib.Path(P.__file__).read_text())
+    fns = [
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "main"
+    ]
+    assert len(fns) == 1, "expected exactly one main()"
+
+    def _calls(node):
+        return {
+            n.func.id
+            for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        } | {
+            n.func.attr
+            for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        }
+
+    # The branch in question is the one selected by `run_only` that loads a
+    # manifest. Not "the smallest If containing load_manifest" -- that is
+    # `if not cache.load_manifest():`, which is a different statement.
+    def _names(node):
+        return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+    holders = [
+        n
+        for n in ast.walk(fns[0])
+        if isinstance(n, ast.If)
+        and "load_manifest" in _calls(n)
+        and "run_only"
+        in {a.attr for a in ast.walk(n.test) if isinstance(a, ast.Attribute)}
+    ]
+    assert holders, (
+        "no run_only-guarded branch calls load_manifest; the test is looking "
+        "at the wrong thing"
+    )
+    for branch in holders:
+        assert "check_cached_elf_gs" in _calls(branch), (
+            "the --run-only branch loads a cached manifest without validating "
+            "the group size those ELFs were built at; --run-only --gs 64 "
+            "against a 128 cache would pack at 64 and execute 128 kernels"
+        )
 
 
 def main():
