@@ -266,6 +266,44 @@ concatenate the operand lists, not just add the expressions.
 Note the ordering: these malformed creates are only *reachable* once assert 1 is bypassed by the
 counts fix, which is why assert 2 appeared to be a separate downstream problem.
 
+### ROOT CAUSE (2026-09-05): the split-info entry stores a map without its operands
+
+Following the dangling symbol back to its producer (`AIRMiscPasses.cpp:2856`):
+
+```cpp
+AffineMap applyMap;
+auto apply = getAffineMapOnMemrefSplitDim(ci, *offsetDimOpt);
+if (apply)
+  applyMap = apply.getAffineMap();          // <- the operands are dropped here
+infoEntryTy newEntry = {*offsetDimOpt, applyMap, splitDimOffset, ...};
+```
+
+`infoEntryTy` is `<split_dim, split_affine_map, split_offset, split_size, split_stride>` — it
+carries **a map and no operands**. That is sound only while the stored map has exactly **one**
+symbol: composition substitutes `s0` with the split offset, the result is a constant, and nothing
+dangles. With a **two**-symbol map — which is what a multi-level loop nest produces, i.e. a herd
+with more than one row — substituting `s0` leaves `s1` referring to an operand that was never
+carried alongside it. `composeAffineExprWithOffsetAndAffineMap` then adds that residue to a
+*different* apply's expression and keeps only that apply's operand list, producing exactly the
+observed `()[s0, s1] -> (s0 + s1)` with one operand.
+
+So both asserts are the same defect seen at two depths: a data structure that is only valid for
+single-symbol maps, used with a multi-symbol one.
+
+**Fix options, in order of honesty:**
+
+1. **Carry the operands.** Store the producing apply's operands in `infoEntryTy` and use them when
+   composing, rebasing the stored map's symbols above the original expression's. Correct, and it
+   changes the tuple type and every user — a real slice, not a patch.
+2. **Re-find the producer at composition time** and take its operands then, leaving the tuple
+   alone. Smaller, but it re-does a lookup the producer already did and can diverge from it.
+3. **Refuse the multi-symbol case** with a clear diagnostic instead of asserting. Does not unblock
+   the 2-row herd, but turns a compiler abort into an explainable failure — worth doing regardless
+   of which of (1) or (2) lands, because an assert is never the right answer to unsupported input.
+
+Only (3) is safe to ship without a numerical gate; (1) and (2) change generated code and need the
+`make run` before/after that this ledger's other rows use.
+
 Both asserts are reproducible in seconds against the committed input above, so a candidate can be
 checked before it is believed — that is how `971bab2a`, "keep the counts", and "canonicalize at the
 create site" were each eliminated. No compiler change is proposed from any of them; the tree is
