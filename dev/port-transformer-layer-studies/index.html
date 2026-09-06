@@ -1296,6 +1296,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Next slice: the LM-head / idle-row family — risk measured 2026-09-05 against 460aadcc">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-herd_rows2-crash-minimal-reproducer-and-what-it-is-not" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The HERD_ROWS=2 crash: minimal reproducer, and what it is not
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -1584,16 +1601,38 @@ test).</p>
 <ol>
 <li><strong>It does not explain the <code>HERD_ROWS=2</code> crash.</strong> That is a different shape — this test never
    asserted on main. The host-only reproducer above remains open and unexplained.</li>
-<li><strong>Main is still missing <code>971bab2a</code>'s operand-ordering guarantee.</strong> Its <code>air::ExecuteOp</code> branch
+<li><strong><code>971bab2a</code>'s operand-ordering fix is now TESTED and ELIMINATED</strong> (2026-09-05). Main is still
+   missing that guarantee — Its <code>air::ExecuteOp</code> branch
    builds <code>originalApplyOperands</code> from <code>getUsedValuesDefinedAbove</code>, an unordered set, while the
    replacement map reuses the apply's expression verbatim — so symbol <em>i</em> need not bind to operand
-   <em>i</em>. <code>mapForExpr</code> (#1934) removed the assert that used to hide this. I applied <code>971bab2a</code>'s fix
-   for it, found it changed <strong>nothing observable</strong> on this test, and <strong>reverted it</strong>: an unverified
-   compiler change with no failing test behind it is not something to land. It is a real candidate
-   for whatever reproduces the <code>HERD_ROWS=2</code> shape.
-Any plan that schedules the LM-head family as an E-side slice hits this abort on its first device
-run.</li>
+   <em>i</em>. <code>mapForExpr</code> (#1934) removed the assert that used to hide it — but applying that
+   fix and running the minimal reproducer below shows it <strong>still aborts</strong>. So it is not the fix for
+   this shape, and it is reverted. The guarantee may still be worth restoring on its own merits;
+   it is no longer a candidate explanation for this crash.</li>
 </ol>
+<h3 id="the-herd_rows2-crash-minimal-reproducer-and-what-it-is-not">The <code>HERD_ROWS=2</code> crash: minimal reproducer, and what it is not<a class="headerlink" href="#the-herd_rows2-crash-minimal-reproducer-and-what-it-is-not" title="Permanent link">&para;</a></h3>
+<p><strong>Control first — this is current main, not a stale install.</strong> The crash was first seen through
+<code>install-main/bin/aircc</code>, dated <strong>Aug 30</strong>. Replaying the <em>exact</em> argv (captured with <code>--verbose</code>)
+against <code>build-xrt/bin/aircc</code>, which contains everything on main, reproduces the identical
+assertion. Only two commits have touched <code>mlir/</code> since Aug 30 and both are #66's behaviour-
+preserving refactor. Method note: an earlier replay with <em>guessed</em> flags produced a different error
+(<code>'air.dma_memcpy_nd' op failed to get buffer</code>) — capture the argv, do not reconstruct it.</p>
+<p><strong>Minimal reproducer — host-only, one second, and committed</strong> so it can actually be run:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>air-opt<span class="w"> </span>mlir/test/Transform/AIRMiscPasses/Inputs/split_l2_herd_rows2_pre_split.mlir<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span>--air-split-l2-memref<span class="o">=</span><span class="s2">"max-launch-channels-mm2s=16 max-launch-channels-s2mm=16 tiles-per-l2-tile=4"</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="c1">#  -&gt; Assertion `willBeValidAffineMap(...)' failed.</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="c1">#     AIRSplitL2MemrefForBufferConstraintPass -&gt; tileChannelOpByFactor</span>
+</code></pre></div>
+<p>The input is <strong>143 lines</strong> and lives under <code>Inputs/</code>, which <code>mlir/test/lit.cfg.py:93</code> excludes from
+the testsuite — it has to, since running the pass on it aborts <code>air-opt</code>. Its header records where
+it came from: aircc's own 24-pass prefix (printed by <code>aircc -v</code>) applied to the matvec GEMV example
+built with a 2-row herd on <code>feat/matvec-herd-rows</code>, and the pass options are the ones aircc uses at
+that stage. Nothing here needs the NPU, so this is a compiler-debugging loop of seconds — and any
+candidate fix can be checked against it by anyone, which is how <code>971bab2a</code> was eliminated above.</p>
+<p><strong>What it is not</strong>: the same shape as the <code>multi_symbol_offset</code> lit (which passes on main, ported
+in #82), and not fixed by <code>971bab2a</code>.
+Any plan that schedules the LM-head family as an E-side slice hits this abort on its first device
+run.</p>
 <p>The plumbing is preserved, unmerged, on <code>feat/matvec-herd-rows</code> (<code>0b7a27a8</code>) with its evidence in
 the commit message; it is deliberately <strong>not</strong> proposed for main, because a CLI knob that aborts
 the compiler is worse than no knob. The measured wins
