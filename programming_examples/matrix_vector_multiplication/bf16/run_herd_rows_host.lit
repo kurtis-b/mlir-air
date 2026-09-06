@@ -1,0 +1,15 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Host-only: `herd_rows` is inert at its default, with the control that shows
+// the comparison can see a change at all. Builds MLIR text only -- no device,
+// no checkpoint, no toolchain beyond python and the air python bindings.
+// One case reads the pre-parameter builder out of git, so it runs inside the
+// work tree rather than from an installed copy.
+//
+// RUN: %PYTHON %S/test_herd_rows_inert.py | FileCheck %s
+// CHECK: PASS  test_default_matches_the_pre_parameter_builder
+// CHECK: PASS  test_omitting_herd_rows_matches_passing_one
+// CHECK: PASS  test_two_rows_differs_by_gaining_a_herd_dimension
+// CHECK: PASS  test_two_rows_differs_from_the_default
+// CHECK: herd_rows inertness tests: 4/4 passed

@@ -37,23 +37,21 @@ makes the fill a plain shape-matching transfer and lets a core slice its own
 window out with arithmetic on its column index.
 
 ``herd_rows`` (default 1) is how many of the device's four core ROWS the herd
-occupies. **At the default it is inert, and that is checked rather than
-asserted** -- ten call sites in ``programming_examples/llms/`` parse
+occupies. **At the default it is inert, and that is guarded by a test rather
+than asserted here** -- ten call sites in ``programming_examples/llms/`` parse
 ``str(build_module(...))`` as MLIR text, so a default that gained a herd
-dimension would change all of them::
+dimension would change all of them. ``test_herd_rows_inert.py`` (collected by
+``run_herd_rows_host.lit``) pins it: omitting the argument equals passing 1,
+passing 2 differs -- the control, without which the first case would also hold
+for a parameter that did nothing -- and it differs specifically by gaining a
+2-D herd. Its fourth case compares against the builder as it stood *before*
+the parameter existed, read out of git at ``3f2dc181``, so the comparison is
+to real predecessor source rather than to a recorded hash that would rot the
+first time an unrelated air.api change moved the text for everyone.
 
-    for r in "" "--herd-rows 1" "--herd-rows 2"; do
-      python3 matvec.py --print-module-only --m 2048 --k 8192 --tile-m 2 \
-        --m-input 1 --herd-m 4 $r --target npu2
-    done
-
-Measured 2026-09-06 against this file's parameter-less predecessor
-(``origin/main`` at ``3f2dc181``, emitted module md5
-``bb9095e3746f55ea8286deb56ac2e78d``, against ``25889a098fe3031c594f61eae0c848da``
-at two rows): the default and an explicit ``--herd-rows 1``
-are **byte-identical** to it, and ``--herd-rows 2`` **differs** -- the control
-that shows the comparison can see a change at all, rather than passing because
-the flag does nothing. Its first divergence is the offset map going from
+For the record, the emitted module was md5 ``bb9095e3746f55ea8286deb56ac2e78d``
+at the default and ``25889a098fe3031c594f61eae0c848da`` at two rows on
+2026-09-06. The first divergence is the offset map going from
 ``()[s0, s1] -> (s0 * 2 + s1)`` to ``()[s0, s1, s2] -> (s0 * 4 + s1 * 2 + s2)``.
 
 That third symbol is exactly what ``air-split-l2-memref`` cannot yet handle, so
@@ -116,14 +114,20 @@ def build_module(
     ), f"tile_m ({tile_m}) must be divisible by m_input ({m_input})"
     assert k % 64 == 0, f"K ({k}) must be divisible by 64 (vector width)"
 
-    # Guard MemTile/L2 capacity for staged A and C tiles.
-    a_l2_bytes = band * k * np.dtype(np_dtype_in).itemsize
-    c_l2_bytes = band * np.dtype(np_dtype_out).itemsize
+    # Guard MemTile/L2 capacity for staged A and C tiles. Deliberately NOT
+    # scaled by herd_rows: this is the figure the kernel registry documents as
+    # the binding constraint on tile_m, and it already approximates -- it
+    # charges the whole pre-split panel to one memtile, where
+    # `air-split-l2-memref` in fact partitions it across the herd's columns.
+    # Multiplying it by herd_rows would make an approximation stricter without
+    # making it truer, and would reject the LM head's own geometry before the
+    # compiler ever reported the multi-row limit that actually blocks it.
+    a_l2_bytes = herd_m * tile_m * k * np.dtype(np_dtype_in).itemsize
+    c_l2_bytes = herd_m * tile_m * np.dtype(np_dtype_out).itemsize
     assert a_l2_bytes + c_l2_bytes <= L2_CAPACITY, (
         f"L2 capacity exceeded: A={a_l2_bytes}B + C={c_l2_bytes}B = "
         f"{a_l2_bytes + c_l2_bytes}B > {L2_CAPACITY}B. "
-        f"Reduce herd_m ({herd_m}), herd_rows ({herd_rows}), tile_m "
-        f"({tile_m}), or k ({k})."
+        f"Reduce herd_m ({herd_m}), tile_m ({tile_m}), or k ({k})."
     )
 
     dt_in, dt_out = DTYPE[np_dtype_in], DTYPE[np_dtype_out]
