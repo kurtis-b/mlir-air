@@ -1721,6 +1721,31 @@ FailureOr<Value> tileChannelOpByFactor(
       return mapForExpr(add);
     };
 
+    // A stored split map with more than one symbol cannot be composed here.
+    // `infoEntryTy` keeps the map but NOT the operands of the apply it came
+    // from (see where it is built, `applyMap = apply.getAffineMap()`), which is
+    // only sound while the map has a single symbol: substituting s0 with the
+    // split offset then leaves a constant. With two symbols the substitution
+    // leaves s1 bound to an operand nobody carried, and the composition below
+    // would build `()[s0, s1] -> ...` while supplying one operand -- an invalid
+    // map that aborts the compiler inside AffineMap::get, or later inside
+    // AffineApplyOp::fold. Refuse it with a diagnostic instead: an assert is
+    // not an answer to unsupported input, and the caller already turns failure
+    // into a clean signalPassFailure().
+    if (splitInfoAffineMap && splitInfoAffineMap.getNumSymbols() > 1) {
+      std::string mapStr;
+      llvm::raw_string_ostream mapOs(mapStr);
+      splitInfoAffineMap.print(mapOs);
+      originalChanOp->emitOpError()
+          << "air-split-l2-memref cannot split this access: its offset map "
+          << mapStr << " has " << splitInfoAffineMap.getNumSymbols()
+          << " symbols, and only one is supported (the split-info entry stores "
+             "the map without the operands that would bind the rest). This "
+             "shape comes from a multi-level loop nest over the split "
+             "dimension, e.g. a herd with more than one row.";
+      return failure();
+    }
+
     AffineMap map;
     if (splitInfoAffineMap || splitInfoSplitSize ||
         splitInfoSplitStrideFactor) {

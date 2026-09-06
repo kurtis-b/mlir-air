@@ -304,6 +304,24 @@ single-symbol maps, used with a multi-symbol one.
 Only (3) is safe to ship without a numerical gate; (1) and (2) change generated code and need the
 `make run` before/after that this ledger's other rows use.
 
+**(3) is done (2026-09-05).** `tileChannelOpByFactor` now refuses a split map with more than one
+symbol and emits a diagnostic naming the op, the map and the reason; the caller already turned
+failure into `signalPassFailure()`. On the committed reproducer the compiler goes from **abort
+(exit 134)** to **a clean error (exit 1)**:
+
+```
+error: 'air.channel.get' op air-split-l2-memref cannot split this access: its offset map
+       ()[s0, s1] -> (s0 * 2 + s1) has 2 symbols, and only one is supported ...
+```
+
+Pinned by `air_split_l2_memref_multi_symbol_refused.mlir`, and mutation-checked in two directions:
+removing the guard fails that test, while **over**-refusing (`> 0` instead of `> 1`) still passes it
+and breaks **3 other tests** in the suite — the new test catches the crash returning, the existing
+suite catches over-refusal. Suite **539 passed / 553, 0 failures** (baseline 538/552 + this test).
+
+**The 2-row herd is still blocked** — this changes an abort into an explanation, nothing more.
+Options (1) and (2) remain the actual fix.
+
 Both asserts are reproducible in seconds against the committed input above, so a candidate can be
 checked before it is believed — that is how `971bab2a`, "keep the counts", and "canonicalize at the
 create site" were each eliminated. No compiler change is proposed from any of them; the tree is
