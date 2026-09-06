@@ -1,0 +1,52 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// The LM-head GEMV's re-execution gate. The research branch found (doc 57
+// section 1.4, devq 446-448, 452, 458) that the 19 x 8192 `lm_head_gemv`
+// multi-launch ELF returned wrong, non-deterministic values in partition 0
+// whenever it executed immediately after itself: 5 of 7 dispatches wrong,
+// healed by running another ELF in between but NOT by a 0.5 s idle.
+// Production decode never places the head next to itself and `make verify`
+// judges token sets, so neither could see it.
+//
+// The family is understood: an ODD per-dispatch LOAD_PDI count ends on the
+// empty reset PDI the next dispatch starts with, the NPU2 firmware skips that
+// load, and launch 0 runs on the previous dispatch's DMA/lock state. The
+// compiler pads odd dispatches, and the branch recorded the 19 x 8192 form
+// re-executing clean once it did (devq 534).
+//
+// This gate is that check, on main. Main still ships the 19 x 8192 geometry,
+// and it reads 7/7 clean here (devq 934, and devq 935 with the control), which
+// confirms main carries the padding fix rather than being green by partition
+// parity. It is a regression guard: a builder or compiler change that brings
+// the family back turns this red.
+//
+// The first line checked is a deliberately corrupted vector that the same
+// judge must reject. Without it a clean verdict would only mean the judge
+// never says WRONG.
+//
+// The gate holds the NPU across d1-d7 (`KernelCache.hold_device()`). It has
+// to: `load_and_run` otherwise releases the lock between dispatches, and
+// under this suite's default parallelism another NPU test's ELF could land in
+// a gap -- which is precisely what heals the stale state, so an interleaved
+// run would turn a real failure clean.
+//
+// No HF weights: random weights against an f32 reference. NPU serialization
+// lives one layer down (KernelCache takes /tmp/npu.lock).
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_lm_head_reexec
+// RUN: cd test_npu2_lm_head_reexec
+// RUN: make -f %S/Makefile check-lm-head-reexec PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// CHECK: [reexec] c0 CONTROL (deliberately corrupted): WRONG
+// CHECK: [reexec] holding the NPU across d1-d7
+// CHECK: [reexec] d1 first dispatch: clean
+// CHECK: [reexec] d2 back-to-back: clean
+// CHECK: [reexec] d3 back-to-back: clean
+// CHECK: [reexec] d4 after 0.5 s idle: clean
+// CHECK: [reexec] d5 new input back-to-back: clean
+// CHECK: [reexec] d6 after other ELF: clean
+// CHECK: [reexec] d7 back-to-back after d6: clean
+// CHECK: [reexec] PASS
