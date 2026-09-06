@@ -42,6 +42,8 @@ K ?= 8192
 TILE_M ?= 4
 M_INPUT ?= 1
 HERD_M ?= 4
+# AIE core rows per column (1..4). >1 fills otherwise-idle rows.
+HERD_ROWS ?= 1
 
 # Backward compat: accept TILE_M_L2 as alias for TILE_M
 ifdef TILE_M_L2
@@ -51,13 +53,13 @@ endif
 all: run
 
 print:
-	${powershell} $(PYTHON) ${srcdir}/matvec.py $(OUTPUT_FORMAT_FLAG) -p --m $(M) --k $(K) --tile-m $(TILE_M) --m-input $(M_INPUT) --herd-m $(HERD_M)
+	${powershell} $(PYTHON) ${srcdir}/matvec.py $(OUTPUT_FORMAT_FLAG) -p --m $(M) --k $(K) --tile-m $(TILE_M) --m-input $(M_INPUT) --herd-m $(HERD_M) --herd-rows $(HERD_ROWS)
 
 run: compile-kernel
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} $(PYTHON) ${srcdir}/matvec.py $(OUTPUT_FORMAT_FLAG) --m $(M) --k $(K) --tile-m $(TILE_M) --m-input $(M_INPUT) --herd-m $(HERD_M)
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} $(PYTHON) ${srcdir}/matvec.py $(OUTPUT_FORMAT_FLAG) --m $(M) --k $(K) --tile-m $(TILE_M) --m-input $(M_INPUT) --herd-m $(HERD_M) --herd-rows $(HERD_ROWS)
 
 profile: compile-kernel build-test-exe
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && $(PYTHON) ${srcdir}/matvec.py $(OUTPUT_FORMAT_FLAG) --compile-mode compile-and-xclbin --m $(M) --k $(K) --tile-m $(TILE_M) --m-input $(M_INPUT) --herd-m $(HERD_M)
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && $(PYTHON) ${srcdir}/matvec.py $(OUTPUT_FORMAT_FLAG) --compile-mode compile-and-xclbin --m $(M) --k $(K) --tile-m $(TILE_M) --m-input $(M_INPUT) --herd-m $(HERD_M) --herd-rows $(HERD_ROWS)
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ./test.exe -x air.xclbin -k MLIR_AIE -i air.insts.bin -M $(M) -K $(K)
 
 # Convenience targets matching IRON GEMV test shapes (4 columns default)
