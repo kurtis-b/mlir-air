@@ -60,6 +60,36 @@ past the plan's base:
 
 **1,505 lines closed.** E's Remaining moves 8,888 → 7,383 and the total 14,855 → 13,350.
 
+## Q10 (the 14 re-measured GEMM rows) — measured 2026-09-06, keep main's
+
+The plan asked whether to adopt the tag's rows for the shapes recorded on both sides with
+different numbers. Measured on `GEMM_bf16_in_bf16_out.json` (the sibling
+`GEMM_bf16_in_fp32_out.json` is byte-identical across all seven keys):
+
+| | rows | common | main-only | tag-only | differing |
+|---|---:|---:|---:|---:|---:|
+| main vs tag | 262 / 142 | 142 | **120** | **0** | **14** |
+
+The plan's count of 14 is exact. Two facts settle the question without needing to adjudicate
+the numbers:
+
+1. **The tag adds no shapes.** Zero tag-only rows; main carries 120 the tag never had. There is
+   nothing to gain in coverage.
+2. **The 14 are not the same measurement disagreeing.** They differ in which METHODS were
+   recorded and in `used_by`: main attributes each shape to a shipped model stage
+   (`llama-3.2-1B K/V proj @L=512 prefill`, `Qwen3-0.6B Down proj @L=1024 prefill`), the tag to
+   the study harness (`transformer-layer study baseline_512 ffn_down (seq=512)`). Several main
+   rows also carry `_note` provenance the tag's do not -- the SigLIP/vision near-zero-atol
+   explanations, the tile_k_l2 within-0.5% tie-break. Adopting the tag's rows would overwrite
+   model-level attribution with study labels and drop those notes.
+
+**Recommendation: keep main's rows; port none of the 14.** What is NOT claimed is that main's
+numbers are the more accurate ones -- the tag re-measured under the forward-pass-only timing
+rule (`d8ed8711`), and where the two record the same method the tag is sometimes higher. They
+are not directly comparable, because the recorded method sets differ per row, and this ledger
+has no artifact that would settle which timing basis a row was taken under. The provenance
+argument stands on its own and does not depend on that.
+
 ## Q15 (FA sliding window) — checked 2026-09-06, closes with no PR
 
 The split plan pre-approved porting the tag's three window lits **if** the check showed main's
