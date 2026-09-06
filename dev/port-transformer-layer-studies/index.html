@@ -1786,34 +1786,67 @@ failure into <code>signalPassFailure()</code>. On the committed reproducer the c
 removing the guard fails that test, while <strong>over</strong>-refusing (<code>&gt; 0</code> instead of <code>&gt; 1</code>) still passes it
 and breaks <strong>3 other tests</strong> in the suite — the new test catches the crash returning, the existing
 suite catches over-refusal. Suite <strong>539 passed / 553, 0 failures</strong> (baseline 538/552 + this test).</p>
-<p><strong>The 2-row herd is still blocked</strong> — this changes an abort into an explanation, nothing more.
-Options (1) and (2) remain the actual fix.</p>
-<p><strong>Option (1) attempted 2026-09-05, and it uncovered a second, independent defect.</strong> The structural
-half alone — widen <code>infoEntryTy</code> to <code>&lt;split_dim, split_affine_map, split_affine_map_operands,
-split_offset, split_size, split_stride&gt;</code>, populate the operands at the producer, read them
-<strong>nowhere</strong> — should be behaviour-neutral. It is not:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>FAIL: Transform/AIRMiscPasses/air_split_l2_memref.mlir
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>  #3 __memcpy_avx512_unaligned_erms
-<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>  #4 llvm::SmallVectorImpl&lt;mlir::Value&gt;::operator=(...)
-<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>  #5 xilinx::AIRSplitL2MemrefForBufferConstraintPass::runOnOperation()
+<p><strong>The 2-row herd is still blocked</strong> — this changes an abort into an explanation, nothing more.</p>
+<p><strong>Options (1) and (2) are both the wrong shape — established 2026-09-06 by instrumenting the
+pass.</strong> The abort's cause is no longer a hypothesis. <code>tileChannelOpByFactor</code> reads its split info
+from <code>splitInfoVec[i]</code>, indexed by <strong>split number, not by op</strong>. The op that aborts is the L2-fill
+<code>air.channel.get</code>, which carries <em>no offsets at all</em> and moves the whole 16-row slab in one
+transfer; it has no apply of its own, and the four entries it is handed were recorded for the
+<strong>herd-side <code>@channel_2</code> puts</strong>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>RECORD op=air.channel.put @channel_2[%c0, %arg0] (%results[%26, 0] [1, 8192] [8192, 1])
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>  applyMap=()[s0, s1] -&gt; (s0 * 2 + s1)        (then + 4, + 8, + 12 for %c1..%c3)
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>PROBE  chanOp=air.channel.get @channel_0[] (%results[] [] [])
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>  splitInfoAffineMap=()[s0, s1] -&gt; (s0 * 2 + s1)   affineApplyOp=(null)
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>  originalApplyOperands=[%c0]
 </code></pre></div>
-<p>A <strong>segfault</strong>, on an existing test, from adding a field nothing reads. Suite 538/553 with the
-change, back to <strong>539/553 with it reverted</strong>, so it is unambiguously the change.</p>
-<p><strong>The cause is NOT established, and a first attempt at explaining it was measured and refuted.</strong>
-The tempting story — "the tuple was all-POD, so a dangling copy survived by accident until a
-heap-allocating member made it fatal" — rests on the old tuple being trivially copyable. It is not:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">static_assert</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">is_trivially_copyable</span><span class="o">&lt;</span><span class="n">infoEntryTy</span><span class="o">&gt;::</span><span class="n">value</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="c1">//  -&gt; error: static assertion failed   (on the tuple as it stands today)</span>
+<p>The constants are right — the four splits take rows +0/+4/+8/+12 of the slab. The <strong>symbols</strong> are
+herd induction variables naming rows <em>within</em> the slab, and they are not in scope at the fill. So
+the operands must not be carried (option 1) or re-found (option 2): there is nothing to bind them
+to. Each unbindable symbol contributes its base, 0, and the slab offset is what survives. Where
+the map has one symbol that is the substitution already performed, so no working case changes:
+<strong>552 / 553, the single failure being <code>air_split_l2_memref_multi_symbol_refused.mlir</code></strong>, the test
+that pins the diagnostic it removes. The reviewer's <code>opToSplitInfoMap</code>-while-iterating candidate is
+<em>not</em> the mechanism — that loop copies nothing on this input (0 <code>UNROLL-COPY</code> events).</p>
+<p><strong>It is still not landable, because clearing the abort exposes a second, independent defect</strong> — and
+it is symmetric: for a 2-row herd the second row's transfers are not connected at <em>either</em> end.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>buffer          shape                 gets  puts  note
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>%results_17     2x8192xbf16              0     1  &lt;-- never filled     (A, L3-&gt;L2 missing)
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>%results_21     2x8192xbf16              0     1  &lt;-- never filled
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>%results_25     2x8192xbf16              0     1  &lt;-- never filled
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>%results_29     2x8192xbf16              0     1  &lt;-- never filled
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>%results_31     2xbf16                   1     0  &lt;-- NEVER DRAINED    (C, L2-&gt;L3 missing)
+<a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>%results_33     2xbf16                   1     0  &lt;-- NEVER DRAINED
+<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>%results_35     2xbf16                   1     0  &lt;-- NEVER DRAINED
+<a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a>%results_37     2xbf16                   1     0  &lt;-- NEVER DRAINED
 </code></pre></div>
-<p>So that mechanism is wrong. <code>SmallVector&lt;Value&gt;</code> may also sit in inline storage, and the trace
-stops at <code>runOnOperation()</code> with no line info, so the copy site is unidentified. <strong>What is
-established is only the A/B</strong>: adding a field nothing reads crashes an existing single-symbol test,
-and reverting restores 539/553. The cause is <strong>unknown</strong>, and settling it needs a
-line-symbolized or ASan build — the insertion into <code>opToSplitInfoMap</code> while iterating
-(<code>AIRMiscPasses.cpp:3315-3329</code>) is a <em>candidate</em>, not a finding.</p>
-<p>The consequence for the port holds regardless of mechanism: <strong>option (1) cannot proceed until that
-crash is understood</strong>, because it requires exactly the change that triggers it. Reverted; no code
-proposed.</p>
+<p>Four A slabs are pushed to the herd having never been filled from L3, and four C buffers are filled
+by the herd and never drained back. Half of A is undefined and half of C is dropped. Those maps
+carry <strong>one</strong> symbol, so this path is untouched by the substitution: it is pre-existing, and was
+merely masked by the abort. A compiler that silently drops half an output is worse than one that
+refuses, so main keeps the #88 diagnostic and the fix stays unlanded on <code>fix/split-l2-multi-symbol</code>
+(<code>19dc50fd</code>).</p>
+<p><strong>Reproducing all of the above takes about a minute, and what is committed is the generators</strong> rather
+than the logs — on that same branch, <code>agents/scripts/split_l2_liveness.py</code> plus three
+<code>AIR_SPLIT_L2_PROBE</code>-guarded probes (record site, compose site, unroll-copy loop), all inert unless
+the variable is set:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>git switch fix/split-l2-multi-symbol &amp;&amp; ninja -C build-xrt air-opt
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>cd mlir/test/Transform/AIRMiscPasses
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>OPT=../../../../build-xrt/bin/air-opt
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>ARGS="--air-split-l2-memref=max-launch-channels-mm2s=16 max-launch-channels-s2mm=16 tiles-per-l2-tile=4"
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>AIR_SPLIT_L2_PROBE=1 $OPT Inputs/split_l2_herd_rows2_pre_split.mlir "$ARGS" &gt;/dev/null  # RECORD/PROBE
+<a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>$OPT Inputs/split_l2_herd_rows2_pre_split.mlir "$ARGS" 2&gt;/dev/null \
+<a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a>  | python3 ../../../../agents/scripts/split_l2_liveness.py                             # the table
+</code></pre></div>
+<p>The liveness check is not vacuous, which was verified rather than assumed: pointed at
+<code>air_split_l2_memref.mlir</code> with its own RUN options — a working single-row split — it finds four
+real L2 buffers with live counts (20/7, 16/6, 15/5, 14/4) and <strong>exits 0</strong>.</p>
+<p><strong>Scope revised.</strong> The blocker is not operand plumbing; it is that <code>air-split-l2-memref</code> does not
+model a herd whose <em>rows</em> subdivide the split dimension — the offset maps and the S2MM gather both
+assume a single row. Options (1)/(2)/(3) as costed above are superseded by that.</p>
+<p><em>(The 2026-09-05 option-(1) segfault — adding an unread <code>SmallVector&lt;Value&gt;</code> field to <code>infoEntryTy</code>
+crashes <code>air_split_l2_memref.mlir</code> at 538/553, reverting restores 539/553 — remains unexplained.
+It is off the critical path now that the field it required is not wanted, and is recorded only as a
+latent hazard in the same structure.)</em></p>
 <p>Both asserts are reproducible in seconds against the committed input above, so a candidate can be
 checked before it is believed — that is how <code>971bab2a</code>, "keep the counts", and "canonicalize at the
 create site" were each eliminated. No compiler change is proposed from any of them; the tree is
