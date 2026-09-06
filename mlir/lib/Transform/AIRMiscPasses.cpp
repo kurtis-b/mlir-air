@@ -1657,6 +1657,31 @@ FailureOr<Value> tileChannelOpByFactor(
     AffineExpr originalExpr =
         getOriginalExpr(affineApplyOp, splitInfoAffineMap);
 
+    // Instrumentation, off unless AIR_SPLIT_L2_PROBE is set in the
+    // environment. It is what established that the stored map handed to this
+    // op belongs to a DIFFERENT op -- `splitInfoVec` is indexed by split
+    // number, not by op -- and it is committed so that claim can be re-checked
+    // rather than taken on trust. See the ledger section this branch supports.
+    if (::getenv("AIR_SPLIT_L2_PROBE")) {
+      llvm::errs() << "PROBE ===============================\n";
+      llvm::errs() << "  chanOp: " << *originalChanOp.getOperation() << "\n";
+      llvm::errs() << "  splitInfoAffineMap: ";
+      if (splitInfoAffineMap)
+        splitInfoAffineMap.print(llvm::errs());
+      else
+        llvm::errs() << "(null)";
+      llvm::errs() << "\n  originalExpr: " << originalExpr << "\n";
+      llvm::errs() << "  affineApplyOp: ";
+      if (affineApplyOp)
+        llvm::errs() << *affineApplyOp;
+      else
+        llvm::errs() << "(null)";
+      llvm::errs() << "\n  originalApplyOperands ("
+                   << originalApplyOperands.size() << "):\n";
+      for (Value v : originalApplyOperands)
+        llvm::errs() << "    " << v << "\n";
+    }
+
     // Preserve original channel indices and prepend the split index
     SmallVector<Value> newIndices;
     newIndices.push_back(
@@ -2892,6 +2917,17 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
       if (apply)
         applyMap = apply.getAffineMap();
 
+      // Companion to the PROBE above: every map recorded here belongs to a
+      // herd-side op, which is what makes handing one to the offset-less
+      // L2-fill get wrong.
+      if (::getenv("AIR_SPLIT_L2_PROBE")) {
+        llvm::errs() << "RECORD op=" << *ci.getOperation() << "\n  applyMap=";
+        if (applyMap)
+          applyMap.print(llvm::errs());
+        else
+          llvm::errs() << "(null)";
+        llvm::errs() << "\n";
+      }
       infoEntryTy newEntry = {*offsetDimOpt, applyMap, splitDimOffset,
                               splitDimSize, splitDimStrideFactor};
       infoEntryMap[*splitDim].push_back(newEntry);
@@ -3332,10 +3368,14 @@ void AIRSplitL2MemrefForBufferConstraintPass::runOnOperation() {
     if (unrollMapEntry == parUnrollMap.end())
       continue;
     for (auto newOpAncestor : std::get<1>(*unrollMapEntry))
-      newOpAncestor->walk(
-          [&opToSplitInfoMap, info](air::ChannelInterface newOp) {
-            opToSplitInfoMap[newOp] = info;
-          });
+      newOpAncestor->walk([&opToSplitInfoMap,
+                           info](air::ChannelInterface newOp) {
+        // Counting these is how the "insertion while iterating" candidate
+        // was eliminated: this loop fires zero times on the reproducer.
+        if (::getenv("AIR_SPLIT_L2_PROBE"))
+          llvm::errs() << "UNROLL-COPY onto " << *newOp.getOperation() << "\n";
+        opToSplitInfoMap[newOp] = info;
+      });
   }
 
   auto context = &getContext();
