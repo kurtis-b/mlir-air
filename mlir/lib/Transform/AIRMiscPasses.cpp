@@ -1738,8 +1738,7 @@ FailureOr<Value> tileChannelOpByFactor(
       splitInfoAffineMap.print(mapOs);
       originalChanOp->emitOpError()
           << "air-split-l2-memref cannot split this access: its offset map "
-          << mapStr << " has "
-          << splitInfoAffineMap.getNumSymbols()
+          << mapStr << " has " << splitInfoAffineMap.getNumSymbols()
           << " symbols, and only one is supported (the split-info entry stores "
              "the map without the operands that would bind the rest). This "
              "shape comes from a multi-level loop nest over the split "
