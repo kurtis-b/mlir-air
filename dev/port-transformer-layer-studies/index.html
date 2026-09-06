@@ -1775,6 +1775,19 @@ single-symbol maps, used with a multi-symbol one.</p>
 </ol>
 <p>Only (3) is safe to ship without a numerical gate; (1) and (2) change generated code and need the
 <code>make run</code> before/after that this ledger's other rows use.</p>
+<p><strong>(3) is done (2026-09-05).</strong> <code>tileChannelOpByFactor</code> now refuses a split map with more than one
+symbol and emits a diagnostic naming the op, the map and the reason; the caller already turned
+failure into <code>signalPassFailure()</code>. On the committed reproducer the compiler goes from <strong>abort
+(exit 134)</strong> to <strong>a clean error (exit 1)</strong>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>error: 'air.channel.get' op air-split-l2-memref cannot split this access: its offset map
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>       ()[s0, s1] -&gt; (s0 * 2 + s1) has 2 symbols, and only one is supported ...
+</code></pre></div>
+<p>Pinned by <code>air_split_l2_memref_multi_symbol_refused.mlir</code>, and mutation-checked in two directions:
+removing the guard fails that test, while <strong>over</strong>-refusing (<code>&gt; 0</code> instead of <code>&gt; 1</code>) still passes it
+and breaks <strong>3 other tests</strong> in the suite — the new test catches the crash returning, the existing
+suite catches over-refusal. Suite <strong>539 passed / 553, 0 failures</strong> (baseline 538/552 + this test).</p>
+<p><strong>The 2-row herd is still blocked</strong> — this changes an abort into an explanation, nothing more.
+Options (1) and (2) remain the actual fix.</p>
 <p>Both asserts are reproducible in seconds against the committed input above, so a candidate can be
 checked before it is believed — that is how <code>971bab2a</code>, "keep the counts", and "canonicalize at the
 create site" were each eliminated. No compiler change is proposed from any of them; the tree is
